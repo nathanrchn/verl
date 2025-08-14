@@ -22,7 +22,7 @@ import os
 import time
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 from uuid import uuid4
 
 import numpy as np
@@ -33,6 +33,8 @@ from sglang.srt.managers.tokenizer_manager import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightsFromTensorReqInput,
+    CreateGrammarReqInput,
+    DeleteGrammarReqInput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -158,6 +160,19 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
 
     async def flush_cache(self):
         return await self.tokenizer_manager.flush_cache()
+    
+    async def create_grammar(self, sampling_params: Dict[str, Any]) -> str:
+        obj = CreateGrammarReqInput(
+            json_schema=sampling_params.get("json_schema", None),
+            regex=sampling_params.get("regex", None),
+            ebnf=sampling_params.get("ebnf", None),
+            structural_tag=sampling_params.get("structural_tag", None),
+        )
+        return await self.tokenizer_manager.create_grammar(obj, None)
+    
+    async def delete_grammar(self, grammar_id: str) -> None:
+        obj = DeleteGrammarReqInput(grammar_id=grammar_id)
+        return await self.tokenizer_manager.delete_grammar(obj, None)
 
     async def abort_request(self, rid: str = "", abort_all: bool = False):
         """Abort a specific request or all requests.
@@ -845,6 +860,9 @@ class SGLangRollout(BaseRollout):
         # Update with any additional kwargs
         request_sampling_params.update(kwargs)
 
+        if self.config.use_grammar_session:
+            await self._setup_grammar_session(request_sampling_params)
+
         while current_turns < self.config.multi_turn.max_assistant_turns:
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
                 await self._handle_pending_state(_req)
@@ -990,6 +1008,9 @@ class SGLangRollout(BaseRollout):
         if current_turns >= self.config.multi_turn.max_assistant_turns:
             finish_reason_type = FinishReasonTypeEnum.STOP
 
+        if self.config.use_grammar_session:
+            await self._teardown_grammar_session(request_sampling_params)
+
         # Calculate the reward for each tool
         async def calc_reward_and_release_fn(name: str, tool: BaseTool):
             reward = await tool.calc_reward(_req.request_id, **_req.tools_kwargs[name].get("calc_reward_kwargs", {}))
@@ -1017,6 +1038,20 @@ class SGLangRollout(BaseRollout):
             # len(input_token_logprobs) = len(input_tokens)-1，because logprob of 1st token is None
             _req.output_token_ids, _req.rollout_log_probs = _extract_logprob_from_output(output)
         return _req
+
+    async def _setup_grammar_session(self, request_sampling_params: dict) -> None:
+        """Setup grammar session by creating grammar ID and cleaning up grammar-related parameters."""
+        grammar_id = await self._engine.create_grammar(request_sampling_params)
+        request_sampling_params["grammar_id"] = grammar_id
+        # Remove grammar-related parameters that should not be passed to the engine
+        for param in ["json_schema", "regex", "ebnf", "structural_tag"]:
+            request_sampling_params.pop(param, None)
+
+    async def _teardown_grammar_session(self, request_sampling_params: dict) -> None:
+        """Teardown grammar session by deleting grammar ID and restoring grammar-related parameters."""
+        grammar_id = request_sampling_params.pop("grammar_id", None)
+        if grammar_id:
+            await self._engine.delete_grammar(grammar_id)
 
     async def _handle_engine_call(
         self, _req: AsyncRolloutRequest, sampling_params: dict, image_data: Optional[list[Any]] = None

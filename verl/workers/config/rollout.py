@@ -143,3 +143,6 @@ class RolloutConfig(BaseConfig):
     layered_summon: bool = False
 
     layer_name_map: dict = field(default_factory=dict)
+
+    # use grammar session to generate structured output over multiple turns (in sglang)
+    use_grammar_session: bool = False
