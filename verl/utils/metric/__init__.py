@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .base import BaseMetric
+from .sft_default import DefaultSFTMetrics
 from .utils import reduce_metrics
 
-__all__ = ["reduce_metrics"]
+__all__ = ["BaseMetric", "DefaultSFTMetrics", "reduce_metrics"]

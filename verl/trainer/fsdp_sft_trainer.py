@@ -51,6 +51,7 @@ from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
 from verl.utils.fs import copy_to_local
+from verl.utils.import_utils import load_extern_type
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -70,9 +71,11 @@ from verl.utils.tracking import Tracking
 from verl.utils.ulysses import (
     gather_outputs_and_unpad,
     get_ulysses_sequence_parallel_world_size,
+    get_ulysses_sequence_parallel_rank,
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.utils.metric.sft_default import DefaultSFTMetrics
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -134,6 +137,9 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(self.config)
         self.device_name = self.config.trainer.device
+
+        # Initialize metrics
+        self._init_metrics()
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -352,6 +358,19 @@ class FSDPSFTTrainer:
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
+    def _init_metrics(self):
+        metrics_cfg = getattr(self.config.trainer, "metrics", None)
+        metrics_cls = DefaultSFTMetrics
+        # Support external metric class via config.trainer.metrics.custom_cls.{path,name}
+        try:
+            if metrics_cfg is not None and hasattr(metrics_cfg, "custom_cls") and metrics_cfg.custom_cls.get("path", None):
+                metrics_cls = load_extern_type(metrics_cfg.custom_cls.path, metrics_cfg.custom_cls.name)
+        except Exception as e:
+            if self.device_mesh.get_rank() == 0:
+                print(f"Falling back to DefaultSFTMetrics due to error loading custom metrics: {e}")
+            metrics_cls = DefaultSFTMetrics
+        self.metrics_impl = metrics_cls(config=metrics_cfg)
+
     def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
@@ -514,15 +533,84 @@ class FSDPSFTTrainer:
         }
 
     def validation_step(self, batch: TensorDict):
+        """Run a forward pass to compute loss and update metrics plugin.
+
+        Returns the scalar loss averaged across data-parallel ranks for convenience.
+        """
         self.fsdp_model.eval()
-        with torch.no_grad():
-            loss = self._compute_loss_and_backward(batch, do_backward=False)
+        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+        with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            input_ids = batch["input_ids"].to(self.device_name)
+            attention_mask = batch["attention_mask"].to(self.device_name)
+            position_ids = batch["position_ids"].to(self.device_name)
+            loss_mask_full = batch["loss_mask"].to(self.device_name)
+
+            if not use_sp:
+                outputs = self.fsdp_model(
+                    input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
+                )
+                logits = outputs.logits  # [B, S, V]
+                shift_logits = logits[:, :-1, :].contiguous()  # [B, S-1, V]
+                shift_labels = input_ids[:, 1:].contiguous()  # [B, S-1]
+                loss_mask = loss_mask_full[:, 1:].contiguous()  # [B, S-1]
+
+            else:
+                # Sequence parallel path: remove padding, slice, forward, gather, and restore padding.
+                batch_size, seqlen = input_ids.shape
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # [1, total_nnz]
+
+                position_ids_rmpad = index_first_axis(
+                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                ).transpose(0, 1)
+
+                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
+                    input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
+                )
+
+                outputs = self.fsdp_model(
+                    input_ids=input_ids_rmpad_sliced,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad_padded,
+                    use_cache=False,
+                )
+                logits_rmpad = outputs.logits.squeeze(0)  # [(total_nnz/sp)+pad, V]
+                logits_rmpad = gather_outputs_and_unpad(
+                    logits_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                )  # [total_nnz, V]
+                # Restore padding back to [B, S, V]
+                full_logits = pad_input(hidden_states=logits_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
+                shift_logits = full_logits[:, :-1, :].contiguous()  # [B, S-1, V]
+                shift_labels = input_ids[:, 1:].contiguous()  # [B, S-1]
+                loss_mask = loss_mask_full[:, 1:].contiguous()  # [B, S-1]
+
+            # Update metrics plugin (cast to fp32 for stability). To avoid double-counting across
+            # sequence-parallel ranks, only update from SP rank 0 when SP is enabled.
+            if (not use_sp) or get_ulysses_sequence_parallel_rank() == 0:
+                self.metrics_impl.update(
+                    shift_logits=shift_logits.float(),
+                    shift_labels=shift_labels,
+                    loss_mask=loss_mask,
+                    tokenizer=self.tokenizer,
+                )
+
+            # Compute average loss for logging convenience
+            loss_fct = nn.CrossEntropyLoss(reduction="none")
+            flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+            flat_labels = shift_labels.view(-1)
+            flat_mask = loss_mask.view(-1).to(flat_logits.dtype)
+            per_tok_loss = loss_fct(flat_logits, flat_labels) * flat_mask
+            loss_sum = per_tok_loss.sum()
+            tok_sum = flat_mask.sum() + 1e-8
+            avg_loss = loss_sum / tok_sum
+
             if is_cuda_available:
-                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+                torch.distributed.all_reduce(avg_loss, op=torch.distributed.ReduceOp.AVG)
             elif is_npu_available:
-                torch.distributed.all_reduce(loss)
-                loss /= self.device_mesh.size(0)
-        return loss
+                torch.distributed.all_reduce(avg_loss)
+                avg_loss /= self.device_mesh.size(0)
+
+        return avg_loss
 
     def save_checkpoint(self, step):
         """Save checkpoint using FSDPCheckpointManager with improved tracking"""
@@ -761,19 +849,19 @@ class FSDPSFTTrainer:
 
                 # early exit or validation step
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                    # Perform validation
-                    val_losses = []
+                    # Perform validation over entire val set
+                    self.metrics_impl.reset()
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
                             self.device_name
                         )
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
+                        _ = self.validation_step(val_data)
+                    # Reduce and compute metrics
+                    self.metrics_impl.reduce()
+                    metrics = self.metrics_impl.compute(prefix="val/")
                     if rank == 0:
-                        val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
-                        last_valid_metric = metric
+                        tracking.log(data=metrics, step=global_step)
+                        last_valid_metric = metrics
                     torch.distributed.barrier()
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
