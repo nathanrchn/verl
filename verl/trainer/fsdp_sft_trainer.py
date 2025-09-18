@@ -539,7 +539,8 @@ class FSDPSFTTrainer:
         """
         self.fsdp_model.eval()
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
-        with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        context = self.sharding_manager if use_sp else nullcontext()
+        with context, torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = batch["input_ids"].to(self.device_name)
             attention_mask = batch["attention_mask"].to(self.device_name)
             position_ids = batch["position_ids"].to(self.device_name)
@@ -593,24 +594,6 @@ class FSDPSFTTrainer:
                     loss_mask=loss_mask,
                     tokenizer=self.tokenizer,
                 )
-
-            # Compute average loss for logging convenience
-            loss_fct = nn.CrossEntropyLoss(reduction="none")
-            flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-            flat_labels = shift_labels.view(-1)
-            flat_mask = loss_mask.view(-1).to(flat_logits.dtype)
-            per_tok_loss = loss_fct(flat_logits, flat_labels) * flat_mask
-            loss_sum = per_tok_loss.sum()
-            tok_sum = flat_mask.sum() + 1e-8
-            avg_loss = loss_sum / tok_sum
-
-            if is_cuda_available:
-                torch.distributed.all_reduce(avg_loss, op=torch.distributed.ReduceOp.AVG)
-            elif is_npu_available:
-                torch.distributed.all_reduce(avg_loss)
-                avg_loss /= self.device_mesh.size(0)
-
-        return avg_loss
 
     def save_checkpoint(self, step):
         """Save checkpoint using FSDPCheckpointManager with improved tracking"""
@@ -855,7 +838,7 @@ class FSDPSFTTrainer:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
                             self.device_name
                         )
-                        _ = self.validation_step(val_data)
+                        self.validation_step(val_data)
                     # Reduce and compute metrics
                     self.metrics_impl.reduce()
                     metrics = self.metrics_impl.compute(prefix="val/")
