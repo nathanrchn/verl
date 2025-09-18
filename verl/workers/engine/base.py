@@ -173,6 +173,12 @@ class BaseEngine:
         """
         raise NotImplementedError
 
+    def generate_sequences(self, prompts: TensorDict) -> Any:
+        """
+        Generate sequences from the model.
+        """
+        raise NotImplementedError
+
 
 class EngineRegistry:
     """

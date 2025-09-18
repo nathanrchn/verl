@@ -38,6 +38,7 @@ from verl.utils.distributed import destroy_global_process_group
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.logger import log_with_rank
 from verl.utils.tracking import Tracking
+from verl.utils.metric.utils import compute_ttr
 
 if is_cuda_available:
     pass
@@ -112,21 +113,16 @@ class SFTTrainer:
             self.rollout_config = omega_conf_to_dataclass(self.config.rollout)
 
     def _build_engine(self):
-        from verl.workers.engine import FSDPEngineWithLMHead
-        from verl.workers.rollout import NaiveRollout
+        from verl.workers.engine import BaseEngine, EngineRegistry
 
-        self.engine = FSDPEngineWithLMHead(
+        self.engine: BaseEngine = EngineRegistry.new(
+            model_type="language_model",
+            backend=self.engine_config.strategy,
             model_config=self.model_config,
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
         )
-
-        if self.rollout_config is not None:
-            self.rollout_engine = NaiveRollout(
-                module=self.engine.module,
-                config=self.rollout_config,
-            )
 
     def _init_engine(self):
         # patch optimizer config
@@ -335,6 +331,7 @@ class SFTTrainer:
                 if is_last_step or (self.test_freq > 0 and is_valid_step):
                     # Perform validation
                     val_losses = []
+                    val_entropies = []
                     for val_data in self.val_dataloader:
                         with self.engine.eval_mode():
                             # construct tensordict
@@ -342,16 +339,41 @@ class SFTTrainer:
                             output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
                             if self.engine.is_mp_src_rank_with_outputs():
                                 val_losses.extend(output["metrics"]["loss"])
+                                val_entropies.extend(output["model_output"]["entropy"])
 
                     if self.engine.is_mp_src_rank_with_outputs():
                         val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+                        val_entropy = torch.mean(torch.tensor(val_entropies, device=self.device_name))
                         # average over data parallel group
                         torch.distributed.all_reduce(
                             val_loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
                         )
+                        torch.distributed.all_reduce(
+                            val_entropy, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                        )
+
+                    if self.rollout_dataloader is not None:
+                        rollout_responses = []
+                        for rollout_data in self.rollout_dataloader:
+                            rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
+                            output = self.engine.generate_sequences(prompts=rollout_data)
+                            if self.engine.is_mp_src_rank_with_outputs():
+                                rollout_responses.extend(output["responses"])
+
+                    if self.engine.is_mp_src_rank_with_outputs():
+                        # compute ttr
+                        ttr = torch.tensor(compute_ttr(rollout_responses), device=self.device_name)
+                        # average over data parallel group
+                        torch.distributed.all_reduce(
+                            ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                        )
 
                     if is_logging:
-                        metric = {"val/loss": val_loss.detach().item()}
+                        metric = {
+                            "val/loss": val_loss.detach().item(),
+                            "val/entropy": val_entropy.detach().item(),
+                            "val/ttr": ttr.detach().item(),
+                        }
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
                     torch.distributed.barrier()
