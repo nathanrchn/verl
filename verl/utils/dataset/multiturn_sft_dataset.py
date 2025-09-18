@@ -70,6 +70,8 @@ class MultiTurnSFTDataset(Dataset):
         self.enable_thinking_key = multiturn_config.get("enable_thinking_key", "enable_thinking")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
         assert self.truncation in ["error", "left", "right"]
+        # for rollout
+        self.add_generation_prompt = config.get("add_generation_prompt", False)
 
         if not isinstance(parquet_files, list | ListConfig):
             parquet_files = [parquet_files]
@@ -251,7 +253,7 @@ class MultiTurnSFTDataset(Dataset):
                 tools=tools,
                 tokenize=True,
                 return_tensors="pt",
-                add_generation_prompt=False,
+                add_generation_prompt=self.add_generation_prompt,
                 enable_thinking=enable_thinking,
                 **self.apply_chat_template_kwargs,
             )

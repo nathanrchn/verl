@@ -108,17 +108,25 @@ class SFTTrainer:
         self.optimizer_config = omega_conf_to_dataclass(self.config.optim)
         self.checkpoint_config = omega_conf_to_dataclass(self.config.checkpoint)
 
-    def _build_engine(self):
-        from verl.workers.engine import BaseEngine, EngineRegistry
+        if self.config.rollout is not None:
+            self.rollout_config = omega_conf_to_dataclass(self.config.rollout)
 
-        self.engine: BaseEngine = EngineRegistry.new(
-            model_type="language_model",
-            backend=self.engine_config.strategy,
+    def _build_engine(self):
+        from verl.workers.engine import FSDPEngineWithLMHead
+        from verl.workers.rollout import NaiveRollout
+
+        self.engine = FSDPEngineWithLMHead(
             model_config=self.model_config,
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
         )
+
+        if self.rollout_config is not None:
+            self.rollout_engine = NaiveRollout(
+                module=self.engine.module,
+                config=self.rollout_config,
+            )
 
     def _init_engine(self):
         # patch optimizer config
@@ -147,7 +155,12 @@ class SFTTrainer:
         train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
         val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+        if self.rollout_config is not None and config.data.rollout_files is not None:
+            rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
+        else:
+            rollout_dataset = None
+
+        self.train_dataset, self.val_dataset, self.rollout_dataset = train_dataset, val_dataset, rollout_dataset
 
     def _build_dataloader(self):
         # build dataset
@@ -190,6 +203,22 @@ class SFTTrainer:
             drop_last=True,
             pin_memory_device=device_name,
         )
+
+        if self.rollout_dataset is not None:
+            self.rollout_sampler = DistributedSampler(
+                self.rollout_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
+            )
+            self.rollout_dataloader = StatefulDataLoader(
+                dataset=self.rollout_dataset,
+                batch_size=self.train_batch_size_per_dp,
+                sampler=self.rollout_sampler,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=True,
+                pin_memory_device=device_name,
+            )
+        else:
+            self.rollout_dataloader = None
 
     def fit(self):
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
