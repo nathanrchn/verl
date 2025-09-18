@@ -428,3 +428,73 @@ class MultiTurnSFTDataset(Dataset):
                 "responses": response_ids,
                 "response_mask": response_loss_mask,
             }
+
+
+SYSTEM_TOKEN = 61
+END_SYSTEM_TOKEN = 62
+DEVELOPER_TOKEN = 63
+END_DEVELOPER_TOKEN = 64
+USER_TOKEN = 65
+END_USER_TOKEN = 66
+ASSISTANT_TOKEN = 67
+END_ASSISTANT_TOKEN = 68
+INNER_TOKEN = 69
+OUTER_TOKEN = 70
+TOOL_CALLS_TOKEN = 71
+END_TOOL_CALLS_TOKEN = 72
+
+
+class ApertusSFTDataset(MultiTurnSFTDataset):
+    def __getitem__(self, item):
+        tokenizer = self.tokenizer
+        messages = self.messages[item]
+        tools = self.tools[item] if self.tools is not None else None
+        enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
+
+        tool_outputs_lengths = []
+        if tools is not None:
+            for message in messages:
+                if message["role"] == "assistant":
+                    for block in message["content"]["blocks"]:
+                        if block["type"] == "tool_outputs":
+                            tool_outputs = block["outputs"]
+
+                            # We format the tool outputs as it is formatted in the chat template
+                            tool_outputs_str = f"[{', '.join([tool_output["output"] for tool_output in tool_outputs])}]"
+                            tool_outputs_lengths.append(len(tokenizer.encode(tool_outputs_str, add_special_tokens=False)))
+
+        input_ids = np.reshape(tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            enable_thinking=enable_thinking,
+            add_generation_prompt=self.add_generation_prompt,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=self.truncation,
+            return_tensors="np",
+            **self.apply_chat_template_kwargs,
+        ), -1)
+
+        # We use cumsum to get the different turns
+        # Then we subtract to remove the first token of each turn because we don't want to train on it
+        start_assistant = np.cumsum(input_ids == ASSISTANT_TOKEN, axis=0) - (input_ids == ASSISTANT_TOKEN).astype(np.int32)
+        end_assistant = np.cumsum(input_ids == END_ASSISTANT_TOKEN, axis=0) - (input_ids == END_ASSISTANT_TOKEN).astype(np.int32)
+
+        # The mask is 1 if the token is not an assistant token and 0 otherwise
+        mask = (start_assistant == end_assistant)
+
+        if len(tool_outputs_lengths) > 0:
+            # We are searching the end of the tool calls (or the start of tool outputs) in the assistant tokens
+            end_tool_calls = (start_assistant != end_assistant) & (input_ids == END_TOOL_CALLS_TOKEN)
+
+            start_tool_output_indices = np.arange(stop=input_ids.shape[0])[end_tool_calls] + 1
+            for i, tol in zip(start_tool_output_indices, tool_outputs_lengths):
+                mask[i:i+tol] = 1
+
+        return {
+            "input_ids": torch.from_numpy(input_ids),
+            "attention_mask": torch.from_numpy(np.ones_like(input_ids)),
+            "position_ids": np.arange(input_ids.shape[0]),
+            "responses": None,
+            "response_mask": torch.from_numpy(np.logical_not(mask).astype(np.int32)),
+        }
