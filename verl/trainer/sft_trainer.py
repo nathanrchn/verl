@@ -109,9 +109,6 @@ class SFTTrainer:
         self.optimizer_config = omega_conf_to_dataclass(self.config.optim)
         self.checkpoint_config = omega_conf_to_dataclass(self.config.checkpoint)
 
-        if self.config.rollout is not None:
-            self.rollout_config = omega_conf_to_dataclass(self.config.rollout)
-
     def _build_engine(self):
         from verl.workers.engine import BaseEngine, EngineRegistry
 
@@ -151,7 +148,7 @@ class SFTTrainer:
         train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
         val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
-        if self.rollout_config is not None and config.data.rollout_files is not None:
+        if config.data.rollout_files is not None:
             rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
         else:
             rollout_dataset = None

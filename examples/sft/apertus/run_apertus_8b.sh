@@ -26,5 +26,5 @@ torchrun --nnodes=1 --nproc_per_node=$nproc_per_node \
     trainer.project_name=apertus-sft \
     trainer.experiment_name=apertus-sft-8b-2509 \
     trainer.test_freq=1 \
-    trainer.logger=['console', 'wandb'] $@ \
+    trainer.logger='["console","wandb"]' $@ \
     use_remove_padding=true
