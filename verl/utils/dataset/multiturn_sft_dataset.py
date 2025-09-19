@@ -22,6 +22,7 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import torch
+from json import loads
 from omegaconf import ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
@@ -448,7 +449,7 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
     def __getitem__(self, item):
         tokenizer = self.tokenizer
         messages = self.messages[item]
-        tools = self.tools[item] if self.tools is not None else None
+        tools = loads(self.tools[item]) if self.tools is not None else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
 
         tool_outputs_lengths = []
