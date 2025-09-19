@@ -51,6 +51,10 @@ rollout_dataset = (
     .map(remove_last_message, num_proc=64)
 )
 
+print(train_dataset)
+print(val_dataset)
+print(rollout_dataset)
+
 train_dataset.to_parquet(os.path.join(OUTPUT_DATASET_PATH, "train.parquet"))
 val_dataset.to_parquet(os.path.join(OUTPUT_DATASET_PATH, "val.parquet"))
 rollout_dataset.to_parquet(os.path.join(OUTPUT_DATASET_PATH, "rollout.parquet"))
