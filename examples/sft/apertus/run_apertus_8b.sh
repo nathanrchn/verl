@@ -15,16 +15,18 @@ torchrun --nnodes=1 --nproc_per_node=$nproc_per_node \
     -m verl.trainer.sft_trainer \
     data.train_files=$dataset_path/train.parquet \
     data.val_files=$dataset_path/val.parquet \
-    data.rollout_files=$dataset_path/rollout.parquet \
-    data.multiturn.enable=true \
-    data.multiturn.messages_key=messages \
-    data.micro_batch_size=4 \
-    data.custom_cls.path=verl.utils.dataset.multiturn_sft_dataset \
+    +data.rollout_files=$dataset_path/rollout.parquet \
+    +data.multiturn.enable=true \
+    +data.multiturn.messages_key=messages \
+    data.micro_batch_size_per_gpu=4 \
+    data.custom_cls.path=verl/utils/dataset/multiturn_sft_dataset.py \
     data.custom_cls.name=ApertusSFTDataset \
-    model.partial_pretrain=swiss-ai/Apertus-8B-2509 \
+    +data.apply_chat_template_kwargs.truncation=true \
+    model.path=swiss-ai/Apertus-8B-2509 \
+    model.tokenizer_path=swiss-ai/Apertus-8B-Instruct-2509 \
+    model.use_remove_padding=true \
     trainer.default_local_dir=$save_path \
     trainer.project_name=apertus-sft \
     trainer.experiment_name=apertus-sft-8b-2509 \
     trainer.test_freq=1 \
-    trainer.logger='["console","wandb"]' $@ \
-    use_remove_padding=true
+    trainer.logger='["console","wandb"]' $@

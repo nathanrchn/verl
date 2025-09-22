@@ -54,7 +54,7 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     return metrics
 
 
-def compute_ttr(responses: list[str]) -> float:
+def compute_ttr(responses: list[list[int]]) -> float:
     """
     Compute the token-to-token ratio of a list of responses.
     """
@@ -63,7 +63,6 @@ def compute_ttr(responses: list[str]) -> float:
 
     output = 0.0
     for response in responses:
-        response_words = response.split()
-        response_unique_words = set(response_words)
-        output += len(response_unique_words) / len(response_words) if len(response_words) > 0 else 0.0
+        response_without_padding = [token for token in response if token != 3]
+        output += len(set(response_without_padding)) / len(response_without_padding) if len(response_without_padding) > 0 else 0.0
     return output / len(responses)

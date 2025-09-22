@@ -105,7 +105,12 @@ class MultiTurnSFTDataset(Dataset):
         self.dataframe = pd.concat(dataframes)
 
         # Extract messages list from dataframe
-        self.messages = self.dataframe[self.messages_key].apply(series_to_item).tolist()
+        self.messages = (
+            self.dataframe[self.messages_key]
+            .apply(series_to_item)
+            .apply(convert_nested_value_to_list_recursive)
+            .tolist()
+        )
 
         # Extract tools list from dataframe
         if self.tools_key in self.dataframe.columns:
@@ -449,7 +454,7 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
     def __getitem__(self, item):
         tokenizer = self.tokenizer
         messages = self.messages[item]
-        tools = loads(self.tools[item]) if self.tools is not None else None
+        tools = loads(self.tools[item]) if self.tools is not None and self.tools[item] != "" else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
 
         tool_outputs_lengths = []
@@ -464,17 +469,20 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
                             tool_outputs_str = f"[{', '.join([tool_output["output"] for tool_output in tool_outputs])}]"
                             tool_outputs_lengths.append(len(tokenizer.encode(tool_outputs_str, add_special_tokens=False)))
 
-        input_ids = np.reshape(tokenizer.apply_chat_template(
+        output = tokenizer.apply_chat_template(
             messages,
             tools=tools,
             enable_thinking=enable_thinking,
             add_generation_prompt=self.add_generation_prompt,
             padding="max_length",
             max_length=self.max_length,
-            truncation=self.truncation,
             return_tensors="np",
+            return_dict=True,
             **self.apply_chat_template_kwargs,
-        ), -1)
+        )
+
+        input_ids = np.reshape(output["input_ids"], -1)
+        attention_mask = np.reshape(output["attention_mask"], -1)
 
         # We use cumsum to get the different turns
         # Then we subtract to remove the first token of each turn because we don't want to train on it
@@ -482,7 +490,7 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
         end_assistant = np.cumsum(input_ids == END_ASSISTANT_TOKEN, axis=0) - (input_ids == END_ASSISTANT_TOKEN).astype(np.int32)
 
         # The mask is 1 if the token is not an assistant token and 0 otherwise
-        mask = (start_assistant == end_assistant)
+        mask = (start_assistant == end_assistant) & np.logical_not(attention_mask)
 
         if len(tool_outputs_lengths) > 0:
             # We are searching the end of the tool calls (or the start of tool outputs) in the assistant tokens
@@ -492,10 +500,11 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
             for i, tol in zip(start_tool_output_indices, tool_outputs_lengths):
                 mask[i:i+tol] = 1
 
+        attention_mask_tensor = torch.from_numpy(attention_mask)
         return {
             "input_ids": torch.from_numpy(input_ids),
-            "attention_mask": torch.from_numpy(np.ones_like(input_ids)),
-            "position_ids": np.arange(input_ids.shape[0]),
-            "responses": None,
-            "response_mask": torch.from_numpy(np.logical_not(mask).astype(np.int32)),
+            "attention_mask": attention_mask_tensor,
+            "position_ids": compute_position_id_with_mask(attention_mask_tensor),
+            "responses": torch.from_numpy(input_ids[1:]),
+            "response_mask": torch.from_numpy(np.logical_not(mask[1:]).astype(np.int32)),
         }

@@ -353,7 +353,7 @@ class FSDPEngine(BaseEngine):
         return optimizer
 
     def _build_lr_scheduler(self, optimizer):
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
         optim_config = self.optimizer_config
 
@@ -371,6 +371,8 @@ class FSDPEngine(BaseEngine):
 
         if warmup_style == "constant":
             lr_scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps)
+        elif warmup_style == "linear":
+            lr_scheduler = get_linear_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps)
         elif warmup_style == "cosine":
             lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
@@ -744,7 +746,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         temperature = micro_batch["temperature"]
-        calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+        calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=True)
 
         input_ids = micro_batch["input_ids"]
         batch_size, seqlen = input_ids.shape
@@ -876,180 +878,37 @@ class FSDPEngineWithLMHead(FSDPEngine):
             return loss, output
 
     def generate_sequences(self, prompts: TensorDict) -> TensorDict:
-        # Extract generation parameters from meta_info with defaults
-        eos_token_id = prompts.meta_info["eos_token_id"]
-        response_length = prompts.meta_info.get("response_length", 256)
-        temperature = prompts.meta_info.get("temperature", 1.0)
-        top_k = prompts.meta_info.get("top_k", 0)  # 0 means no top_k filtering
-        top_p = prompts.meta_info.get("top_p", 1.0)
-        do_sample = prompts.meta_info.get("do_sample", True)
+        device_name = get_device_name()
+        response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
 
-        # Extract initial inputs
-        input_ids = prompts.batch["input_ids"].clone()  # (bs, prompt_length)
-        attention_mask = prompts.batch["attention_mask"].clone()  # (bs, prompt_length)
-        position_ids = prompts.batch["position_ids"].clone() if "position_ids" in prompts.batch else None
-
+        input_ids = prompts["input_ids"].to(device_name)
+        attention_mask = prompts["attention_mask"].to(device_name)
         batch_size, prompt_length = input_ids.shape
-        device = input_ids.device
 
-        # Set model to eval mode
         self.module.eval()
 
-        # Keep track of unfinished sequences
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=device)
+        with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            generated_sequences = self.module.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=response_length,
+                eos_token_id=[68, 71], # TODO: fix this
+                pad_token_id=3, # TODO: fix this
+                do_sample=False,
+                use_cache=True,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
 
-        # Initialize position_ids if not provided
-        if position_ids is None:
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-
-        # Store logits for computing log_probs later
-        logits_list = []
-
-        # Generate tokens one by one
-        with torch.no_grad():
-            for _ in range(response_length):
-                # Create micro_batch for current step - reuse existing infrastructure
-                current_batch = TensorDict(
-                    {
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "position_ids": position_ids,
-                        "temperature": torch.tensor(temperature, device=device).expand(batch_size),
-                    },
-                    batch_size=batch_size,
-                )
-
-                # Copy multi_modal_inputs if present
-                if "multi_modal_inputs" in prompts.batch:
-                    current_batch["multi_modal_inputs"] = prompts.batch["multi_modal_inputs"]
-
-                # Use existing prepare_model_inputs method
-                model_inputs, output_args = self.prepare_model_inputs(current_batch)
-
-                # Forward through model to get raw logits
-                device_name = get_device_name()
-                with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-                    raw_output = self.module(**model_inputs, use_cache=False)
-
-                # Extract logits from raw output
-                if hasattr(raw_output, "logits"):
-                    current_logits = raw_output.logits
-                else:
-                    # Handle different output formats, but avoid last_hidden_state
-                    current_logits = raw_output[0] if isinstance(raw_output, tuple) else raw_output
-
-                # Handle remove_padding case - need to reconstruct full logits
-                use_remove_padding = tu.get_non_tensor_data(data=current_batch, key="use_remove_padding", default=True)
-                if use_remove_padding and self.use_remove_padding:
-                    indices = output_args["indices"]
-                    logits_rmpad = current_logits.squeeze(0)  # (total_nnz, vocab_size)
-
-                    # Gather outputs if using Ulysses SP
-                    if self.use_ulysses_sp:
-                        pad_size = output_args["pad_size"]
-                        logits_rmpad = gather_outputs_and_unpad(
-                            logits_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
-                        )
-
-                    # Pad back to full shape
-                    full_logits = pad_input(
-                        hidden_states=logits_rmpad, indices=indices, batch=batch_size, seqlen=input_ids.shape[1]
-                    )  # (batch_size, seqlen, vocab_size)
-
-                    # Get logits for the last token position
-                    next_token_logits = full_logits[:, -1, :]  # (batch_size, vocab_size)
-                else:
-                    # Standard case - get logits for last position
-                    next_token_logits = current_logits[:, -1, :]  # (batch_size, vocab_size)
-
-                # Apply temperature scaling
-                if temperature > 0:
-                    next_token_logits = next_token_logits / temperature
-
-                # Apply top_k filtering
-                if top_k > 0:
-                    top_k_values, _ = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
-                    next_token_logits[next_token_logits < top_k_values[:, [-1]]] = -float("inf")
-
-                # Apply top_p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-                    # Remove tokens with cumulative probability above the threshold
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    # Keep at least one token
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-
-                    # Scatter back to original indexing
-                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                    next_token_logits[indices_to_remove] = -float("inf")
-
-                # Store logits before sampling for log_prob computation
-                logits_list.append(next_token_logits.clone())
-
-                # Sample next token
-                if do_sample and temperature > 0:
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_tokens = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
-                else:
-                    next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # (batch_size, 1)
-
-                # For finished sequences, replace generated token with padding token (or eos)
-                next_tokens = next_tokens * unfinished_sequences.unsqueeze(-1) + eos_token_id * (
-                    1 - unfinished_sequences.unsqueeze(-1)
-                )
-
-                # Update sequences
-                input_ids = torch.cat([input_ids, next_tokens], dim=1)
-
-                # Update attention mask
-                attention_mask = torch.cat([attention_mask, unfinished_sequences.unsqueeze(-1)], dim=1)
-
-                # Update unfinished sequences
-                if isinstance(eos_token_id, list):
-                    for eos_id in eos_token_id:
-                        unfinished_sequences.masked_fill_(
-                            (next_tokens.squeeze(-1) == eos_id) & (unfinished_sequences == 1), 0
-                        )
-                else:
-                    unfinished_sequences.masked_fill_(
-                        (next_tokens.squeeze(-1) == eos_token_id) & (unfinished_sequences == 1), 0
-                    )
-
-                # Update position_ids
-                if position_ids.dim() == 3:  # qwen2vl mrope case
-                    # Handle multi-dimensional position_ids
-                    next_position_ids = position_ids[:, :, -1:] + 1  # (3, batch_size, 1)
-                    position_ids = torch.cat([position_ids, next_position_ids], dim=2)
-                else:
-                    # Standard position_ids
-                    next_position_ids = position_ids[:, -1:] + 1  # (batch_size, 1)
-                    position_ids = torch.cat([position_ids, next_position_ids], dim=1)
-
-                # Early exit if all sequences have finished
-                if unfinished_sequences.max() == 0:
-                    break
-
-        # Prepare outputs
-        generated_sequences = input_ids  # (batch_size, prompt_length + response_length)
-        prompt_ids = generated_sequences[:, :prompt_length]  # (batch_size, prompt_length)
-        response_ids = generated_sequences[:, prompt_length:]  # (batch_size, response_length)
-
-        # Compute log probabilities for the generated response
-        response_logits = torch.stack(logits_list, dim=1)  # (batch_size, response_length, vocab_size)
-        response_log_probs = logprobs_from_logits(logits=response_logits, labels=response_ids)
+        sequences = generated_sequences.sequences
+        prompt_ids = sequences[:, :prompt_length]
+        response_ids = sequences[:, prompt_length:]
 
         return TensorDict(
             {
                 "input_ids": prompt_ids,
                 "responses": response_ids,
-                "sequences": generated_sequences,
-                "old_log_probs": response_log_probs,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
+                "sequences": sequences,
             },
             batch_size=batch_size,
         )

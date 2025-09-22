@@ -60,7 +60,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
     Args:
         lr (float): Learning rate.
         min_lr_ratio (Optional[float]): Minimum LR ratio for cosine schedule.
-        warmup_style (str): LR warmup style: "constant" or "cosine".
+        warmup_style (str): LR warmup style: "constant", "linear", or "cosine".
         num_cycles (float): Number of cosine cycles in LR schedule.
     """
 
@@ -69,7 +69,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
     num_cycles: float = 0.5
 
     def __post_init__(self):
-        assert self.warmup_style in ["constant", "cosine"]
+        assert self.warmup_style in ["constant", "linear", "cosine"]
         return super().__post_init__()
 
 

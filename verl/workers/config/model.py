@@ -49,6 +49,7 @@ class HFModelConfig(BaseConfig):
     local_hf_config_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
     local_tokenizer_path: Optional[str] = None
+    revision: str = "main"
 
     # whether to load tokenizer. This is useful when we only want to load model config
     load_tokenizer: bool = True
@@ -111,13 +112,13 @@ class HFModelConfig(BaseConfig):
 
         self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)
         self.generation_config = get_generation_config(
-            self.local_hf_config_path, trust_remote_code=self.trust_remote_code
+            self.local_hf_config_path, trust_remote_code=self.trust_remote_code, revision=self.revision
         )
 
         # constuct hf_config
         attn_implementation = self.override_config.get("attn_implementation", "flash_attention_2")
         self.hf_config = AutoConfig.from_pretrained(
-            self.local_hf_config_path, trust_remote_code=self.trust_remote_code, attn_implementation=attn_implementation
+            self.local_hf_config_path, trust_remote_code=self.trust_remote_code, attn_implementation=attn_implementation, revision=self.revision
         )
 
         override_config_kwargs = {}

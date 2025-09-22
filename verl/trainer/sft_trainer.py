@@ -148,7 +148,10 @@ class SFTTrainer:
         train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
         val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
-        if config.data.rollout_files is not None:
+        if hasattr(config.data, "rollout_files") and config.data.rollout_files is not None:
+            if hasattr(config.data, "rollout_max_size") and config.data.rollout_max_size is not None:
+                config.data.max_length = config.data.rollout_max_size
+            
             rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
         else:
             rollout_dataset = None
@@ -213,10 +216,69 @@ class SFTTrainer:
         else:
             self.rollout_dataloader = None
 
+    def _validate_rollout(self, is_logging, meta_info, global_step, tracking):
+        last_valid_metric = None
+
+        # Perform validation
+        val_losses = []
+        val_entropies = []
+        for val_data in tqdm(self.val_dataloader, desc="validation", disable=not is_logging):
+            with self.engine.eval_mode():
+                # construct tensordict
+                val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
+                output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
+                if self.engine.is_mp_src_rank_with_outputs():
+                    val_losses.extend(output["metrics"]["loss"])
+                    response_mask = val_data["response_mask"].to(self.device_name).to(bool)
+                    entropy = output["model_output"]["entropy"].to(self.device_name)
+                    val_entropies.extend(torch.sum(entropy * response_mask, dim=-1) / torch.sum(response_mask, dim=-1))
+
+        if self.engine.is_mp_src_rank_with_outputs():
+            val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+            val_entropy = torch.mean(torch.tensor(val_entropies, device=self.device_name))
+            # average over data parallel group
+            torch.distributed.all_reduce(
+                val_loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+            )
+            torch.distributed.all_reduce(
+                val_entropy, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+            )
+
+        if self.rollout_dataloader is not None:
+            rollout_responses = []
+            for rollout_data in tqdm(self.rollout_dataloader, desc="rollout", disable=not is_logging):
+                rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
+                output = self.engine.generate_sequences(prompts=rollout_data)
+                if self.engine.is_mp_src_rank_with_outputs():
+                    rollout_responses.extend(output["responses"].tolist())
+
+            if self.engine.is_mp_src_rank_with_outputs():
+                print(rollout_responses[:2])
+                # compute ttr
+                ttr = torch.tensor(compute_ttr(rollout_responses), device=self.device_name)
+                # average over data parallel group
+                torch.distributed.all_reduce(
+                    ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                )
+
+        if is_logging:
+            metric = {
+                "val/loss": val_loss.detach().item(),
+                "val/entropy": val_entropy.detach().item(),
+            }
+            if self.rollout_dataloader is not None:
+                metric["val/ttr"] = ttr.detach().item()
+            tracking.log(data=metric, step=global_step)
+            last_valid_metric = metric
+        torch.distributed.barrier()
+
+        return last_valid_metric
+
     def fit(self):
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
 
         # TODO: add a unified tracking
+        tracking = None
         if is_logging:
             tracking = Tracking(
                 project_name=self.config.trainer.project_name,
@@ -253,8 +315,11 @@ class SFTTrainer:
             "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
             "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
             "temperature": 1.0,
+            "response_length": 128,
             "global_batch_size": self.global_batch_size,
         }
+
+        last_valid_metric = self._validate_rollout(is_logging, meta_info, global_step, tracking)
 
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
@@ -326,54 +391,7 @@ class SFTTrainer:
 
                 # early exit or validation step
                 if is_last_step or (self.test_freq > 0 and is_valid_step):
-                    # Perform validation
-                    val_losses = []
-                    val_entropies = []
-                    for val_data in self.val_dataloader:
-                        with self.engine.eval_mode():
-                            # construct tensordict
-                            val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
-                            output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
-                            if self.engine.is_mp_src_rank_with_outputs():
-                                val_losses.extend(output["metrics"]["loss"])
-                                val_entropies.extend(output["model_output"]["entropy"])
-
-                    if self.engine.is_mp_src_rank_with_outputs():
-                        val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
-                        val_entropy = torch.mean(torch.tensor(val_entropies, device=self.device_name))
-                        # average over data parallel group
-                        torch.distributed.all_reduce(
-                            val_loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                        )
-                        torch.distributed.all_reduce(
-                            val_entropy, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                        )
-
-                    if self.rollout_dataloader is not None:
-                        rollout_responses = []
-                        for rollout_data in self.rollout_dataloader:
-                            rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
-                            output = self.engine.generate_sequences(prompts=rollout_data)
-                            if self.engine.is_mp_src_rank_with_outputs():
-                                rollout_responses.extend(output["responses"])
-
-                    if self.engine.is_mp_src_rank_with_outputs():
-                        # compute ttr
-                        ttr = torch.tensor(compute_ttr(rollout_responses), device=self.device_name)
-                        # average over data parallel group
-                        torch.distributed.all_reduce(
-                            ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                        )
-
-                    if is_logging:
-                        metric = {
-                            "val/loss": val_loss.detach().item(),
-                            "val/entropy": val_entropy.detach().item(),
-                            "val/ttr": ttr.detach().item(),
-                        }
-                        tracking.log(data=metric, step=global_step)
-                        last_valid_metric = metric
-                    torch.distributed.barrier()
+                    last_valid_metric = self._validate_rollout(is_logging, meta_info, global_step, tracking)
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     self.ckpt_handler.save_checkpoint(step=global_step)
