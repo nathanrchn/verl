@@ -56,7 +56,7 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
 
 def compute_ttr(responses: list[list[int]]) -> float:
     """
-    Compute the token-to-token ratio of a list of responses.
+    Compute the 3-gram uniqueness ratio of a list of responses.
     """
     if len(responses) == 0:
         return 0.0
@@ -64,5 +64,16 @@ def compute_ttr(responses: list[list[int]]) -> float:
     output = 0.0
     for response in responses:
         response_without_padding = [token for token in response if token != 3]
-        output += len(set(response_without_padding)) / len(response_without_padding) if len(response_without_padding) > 0 else 0.0
-    return output / len(responses)
+        if len(response_without_padding) < 3:
+            continue
+        
+        trigrams = []
+        for i in range(len(response_without_padding) - 2):
+            trigram = tuple(response_without_padding[i:i+3])
+            trigrams.append(trigram)
+        
+        if len(trigrams) > 0:
+            output += len(set(trigrams)) / len(trigrams)
+    
+    valid_responses = sum(1 for response in responses if len([token for token in response if token != 3]) >= 3)
+    return output / valid_responses if valid_responses > 0 else 0.0

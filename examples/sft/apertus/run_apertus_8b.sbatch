@@ -63,7 +63,8 @@ RUN_NAME="${MODEL_NAME}-${MODEL_REVISION}-lr${LEARNING_RATE}-bs${MICRO_BATCH_SIZ
 nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 head_node=${nodes[0]}
 
-save_path="$SAVE_FOLDER/$RUN_NAME"
+current_datetime=$(date '+%Y-%m-%d_%H-%M-%S')
+save_path="$SAVE_FOLDER/$RUN_NAME/$current_datetime"
 dataset_path=$DATASET_PATH
 
 mkdir -p "$save_path"
@@ -104,6 +105,7 @@ torchrun --nnodes=${SLURM_NNODES} --nproc_per_node=4 --node_rank=${local_rank} -
     +data.rollout_max_size=$ROLLOUT_MAX_LENGTH \
     data.max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU \
     +data.apply_chat_template_kwargs.truncation=true \
+    +data.add_generation_prompt=false \
     model.path=$MODEL_PATH \
     +model.revision=$MODEL_REVISION \
     model.tokenizer_path=$TOKENIZER_PATH \
@@ -112,6 +114,7 @@ torchrun --nnodes=${SLURM_NNODES} --nproc_per_node=4 --node_rank=${local_rank} -
     optim.lr=$LEARNING_RATE \
     optim.warmup_style=$WARMUP_STYLE \
     optim.lr_warmup_steps_ratio=$LR_WARMUP_STEPS_RATIO \
+    checkpoint.save_contents='["model","optimizer","extra","hf_model"]' \
     trainer.default_local_dir=$save_path \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$RUN_NAME \

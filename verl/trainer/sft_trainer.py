@@ -67,6 +67,7 @@ class SFTTrainer:
 
         # Initialize resume-related variables
         self.resume_global_step = 0
+        self.cumulative_tokens = 0  # Track cumulative tokens across all steps
 
         self._init_engine()
 
@@ -152,6 +153,7 @@ class SFTTrainer:
             if hasattr(config.data, "rollout_max_size") and config.data.rollout_max_size is not None:
                 config.data.max_length = config.data.rollout_max_size
             
+            config.data.add_generation_prompt = True
             rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
         else:
             rollout_dataset = None
@@ -231,7 +233,7 @@ class SFTTrainer:
                     val_losses.extend(output["metrics"]["loss"])
                     response_mask = val_data["response_mask"].to(self.device_name).to(bool)
                     entropy = output["model_output"]["entropy"].to(self.device_name)
-                    val_entropies.extend(torch.sum(entropy * response_mask, dim=-1) / torch.sum(response_mask, dim=-1))
+                    val_entropies.append(torch.sum(entropy * response_mask) / torch.sum(response_mask))
 
         if self.engine.is_mp_src_rank_with_outputs():
             val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
@@ -315,7 +317,7 @@ class SFTTrainer:
             "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
             "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
             "temperature": 1.0,
-            "response_length": 128,
+            "response_length": 256,
             "global_batch_size": self.global_batch_size,
         }
 
@@ -371,12 +373,16 @@ class SFTTrainer:
                     batch_seqlens = output_tensor.tolist()
                     loss = loss.item()
 
+                    current_step_tokens = output_tensor.sum().item()
+                    self.cumulative_tokens += current_step_tokens
+
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                     metrics["loss"] = loss
                     metrics["train/loss"] = metrics.pop("loss")
                     metrics["train/grad_norm"] = metrics.pop("grad_norm")
                     metrics["train/lr"] = lr
-                    metrics["train/global_tokens"] = output_tensor.sum().item()
+                    metrics["train/global_tokens"] = current_step_tokens
+                    metrics["train/cumulative_tokens"] = self.cumulative_tokens
                     # mfu
                     delta_time = timer.last
                     estimated_flops, promised_flops = self.flops_counter.estimate_flops(batch_seqlens, delta_time)

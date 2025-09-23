@@ -490,7 +490,7 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
         end_assistant = np.cumsum(input_ids == END_ASSISTANT_TOKEN, axis=0) - (input_ids == END_ASSISTANT_TOKEN).astype(np.int32)
 
         # The mask is 1 if the token is not an assistant token and 0 otherwise
-        mask = (start_assistant == end_assistant) & np.logical_not(attention_mask)
+        mask = (start_assistant == end_assistant)
 
         if len(tool_outputs_lengths) > 0:
             # We are searching the end of the tool calls (or the start of tool outputs) in the assistant tokens
