@@ -363,7 +363,7 @@ class SFTTrainer:
                     metrics = output["metrics"]
 
                     losses = torch.tensor(metrics["loss"], device=self.device_name)
-                    num_tokens = torch.tensor(metrics["num_tokens"], device=self.device_name)
+                    num_tokens = torch.tensor(metrics.pop("num_tokens"), device=self.device_name)  # remove num_tokens from metrics
                     if torch.sum(num_tokens) > 0:
                         loss = torch.sum(losses * num_tokens) / torch.sum(num_tokens)
                     else:
