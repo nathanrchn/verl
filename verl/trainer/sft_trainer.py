@@ -189,12 +189,14 @@ class SFTTrainer:
             pin_memory_device=device_name,
         )
 
+        val_batch_size_per_dp = (config.data.val_batch_size or self.global_batch_size) // dp_size
+
         self.val_sampler = DistributedSampler(
             self.val_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
-            batch_size=self.train_batch_size_per_dp,
+            batch_size=val_batch_size_per_dp,
             sampler=self.val_sampler,
             num_workers=8,
             pin_memory=True,
@@ -203,12 +205,14 @@ class SFTTrainer:
         )
 
         if self.rollout_dataset is not None:
+            rollout_batch_size_per_dp = (config.data.rollout_batch_size or self.global_batch_size) // dp_size
+
             self.rollout_sampler = DistributedSampler(
                 self.rollout_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
             )
             self.rollout_dataloader = StatefulDataLoader(
                 dataset=self.rollout_dataset,
-                batch_size=self.train_batch_size_per_dp,
+                batch_size=rollout_batch_size_per_dp,
                 sampler=self.rollout_sampler,
                 num_workers=8,
                 pin_memory=True,
@@ -358,7 +362,12 @@ class SFTTrainer:
                 if self.engine.is_mp_src_rank_with_outputs():
                     metrics = output["metrics"]
 
-                    loss = torch.mean(torch.tensor(metrics["loss"], device=self.device_name))
+                    losses = torch.tensor(metrics["loss"], device=self.device_name)
+                    num_tokens = torch.tensor(metrics["num_tokens"], device=self.device_name)
+                    if torch.sum(num_tokens) > 0:
+                        loss = torch.sum(losses * num_tokens) / torch.sum(num_tokens)
+                    else:
+                        loss = torch.tensor(0.0, device=self.device_name)
 
                     # mean over dp group
                     batch_seqlens = data["attention_mask"].sum(dim=-1).to(self.device_name)  # (global_bsz // dp)

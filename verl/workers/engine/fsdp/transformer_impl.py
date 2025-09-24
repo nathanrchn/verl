@@ -472,12 +472,13 @@ class FSDPEngine(BaseEngine):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
-                    global_bsz = data["global_batch_size"]
-                    local_micro_bsz = micro_batch["input_ids"].shape[0]
-                    # metrics contain the output, loss is dummy
-                    loss_scale_factor = local_micro_bsz / (global_bsz / self.get_data_parallel_size())
-                    # scale loss
-                    loss = loss * loss_scale_factor
+                    total_tokens_on_rank = data["response_mask"].sum()
+                    num_tokens_in_micro = micro_batch["response_mask"].sum()
+                    if total_tokens_on_rank > 0:
+                        loss_scale_factor = num_tokens_in_micro / total_tokens_on_rank
+                        loss = loss * loss_scale_factor
+                    else:
+                        loss = loss * 0
                     loss.backward()
 
             output_lst.append(meta_info)
