@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
-#SBATCH --nodes=16
+#SBATCH --nodes=4
 #SBATCH --partition=normal
 #SBATCH --environment=nccl
 #SBATCH --output=logs/%j/log.out
@@ -31,8 +31,11 @@ MODEL_DTYPE="bf16"
 # Data configuration
 MICRO_BATCH_SIZE_PER_GPU=32
 MAX_LENGTH=4096
+TRAIN_BATCH_SIZE=32
+VAL_BATCH_SIZE=256
+ROLLOUT_BATCH_SIZE=256
 ROLLOUT_MAX_LENGTH=512
-MAX_TOKEN_LEN_PER_GPU=32768
+MAX_TOKEN_LEN_PER_GPU=8192 # 65536
 TRAIN_FILE="train.parquet"
 VAL_FILE="val.parquet"
 ROLLOUT_FILE="rollout.parquet"
@@ -42,14 +45,17 @@ LEARNING_RATE="5e-6"
 WARMUP_STYLE="linear"
 LR_WARMUP_STEPS_RATIO=0.03
 TOTAL_EPOCHS=1
-TEST_FREQ=32
+TEST_FREQ=128
+TOTAL_TRAINING_STEPS=null
 
 # Experiment configuration
-PROJECT_NAME="apertus-sft"
+PROJECT_NAME="apertus-sft-ablations"
 
 # Multi-turn configuration
 ENABLE_MULTITURN=true
 MESSAGES_KEY="messages"
+TOOLS_KEY="tools"
+ENABLE_THINKING_KEY="enable_thinking"
 CUSTOM_CLS_PATH="verl/utils/dataset/multiturn_sft_dataset.py"
 CUSTOM_CLS_NAME="ApertusSFTDataset"
 
@@ -58,7 +64,7 @@ LOGGER='["console","wandb"]'
 
 # Generate run name and experiment name from key parameters
 MODEL_NAME=$(basename "$MODEL_PATH")
-RUN_NAME="${MODEL_NAME}-${MODEL_REVISION}-lr${LEARNING_RATE}-bs${MICRO_BATCH_SIZE_PER_GPU}-test${TEST_FREQ}"
+RUN_NAME="${MODEL_NAME}-${MODEL_REVISION}-lr${LEARNING_RATE}-bs${TRAIN_BATCH_SIZE}-test${TEST_FREQ}-warmup${WARMUP_STYLE}-lr_warmup_steps_ratio${LR_WARMUP_STEPS_RATIO}"
 
 nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 head_node=${nodes[0]}
@@ -95,13 +101,17 @@ torchrun --nnodes=${SLURM_NNODES} --nproc_per_node=4 --node_rank=${local_rank} -
     -m verl.trainer.sft_trainer \
     data.train_files=$dataset_path/$TRAIN_FILE \
     data.val_files=$dataset_path/$VAL_FILE \
-    +data.rollout_files=$dataset_path/$ROLLOUT_FILE \
-    +data.multiturn.enable=$ENABLE_MULTITURN \
-    +data.multiturn.messages_key=$MESSAGES_KEY \
+    data.rollout_files=$dataset_path/$ROLLOUT_FILE \
+    data.messages_key=$MESSAGES_KEY \
+    data.tools_key=$TOOLS_KEY \
+    data.enable_thinking_key=$ENABLE_THINKING_KEY \
     data.micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
     data.custom_cls.path=$CUSTOM_CLS_PATH \
     data.custom_cls.name=$CUSTOM_CLS_NAME \
     data.max_length=$MAX_LENGTH \
+    data.train_batch_size=$TRAIN_BATCH_SIZE \
+    data.val_batch_size=$VAL_BATCH_SIZE \
+    data.rollout_batch_size=$ROLLOUT_BATCH_SIZE \
     +data.rollout_max_size=$ROLLOUT_MAX_LENGTH \
     data.max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU \
     +data.apply_chat_template_kwargs.truncation=true \
@@ -119,6 +129,7 @@ torchrun --nnodes=${SLURM_NNODES} --nproc_per_node=4 --node_rank=${local_rank} -
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$RUN_NAME \
     trainer.test_freq=$TEST_FREQ \
+    trainer.total_training_steps=$TOTAL_TRAINING_STEPS \
     trainer.total_epochs=$TOTAL_EPOCHS \
     trainer.logger=$LOGGER" &
 done

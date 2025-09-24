@@ -189,6 +189,8 @@ class SFTTrainer:
             pin_memory_device=device_name,
         )
 
+
+
         self.val_sampler = DistributedSampler(
             self.val_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
@@ -218,7 +220,23 @@ class SFTTrainer:
         else:
             self.rollout_dataloader = None
 
-    def _validate_rollout(self, is_logging, meta_info, global_step, tracking):
+    def _get_meta_info(self, mode):
+        global_batch_size = self.global_batch_size
+        if mode == "val" and self.config.data.val_batch_size is not None:
+            global_batch_size = self.config.data.val_batch_size
+        elif mode == "rollout" and self.config.data.rollout_batch_size is not None:
+            global_batch_size = self.config.data.rollout_batch_size
+        
+        return {
+            "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
+            "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
+            "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
+            "temperature": 1.0,
+            "response_length": 256,
+            "global_batch_size": global_batch_size,
+        }
+
+    def _validate_rollout(self, is_logging, global_step, tracking):
         last_valid_metric = None
 
         # Perform validation
@@ -227,7 +245,7 @@ class SFTTrainer:
         for val_data in tqdm(self.val_dataloader, desc="validation", disable=not is_logging):
             with self.engine.eval_mode():
                 # construct tensordict
-                val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
+                val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=self._get_meta_info(mode="val"))
                 output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
                 if self.engine.is_mp_src_rank_with_outputs():
                     val_losses.extend(output["metrics"]["loss"])
@@ -249,7 +267,7 @@ class SFTTrainer:
         if self.rollout_dataloader is not None:
             rollout_responses = []
             for rollout_data in tqdm(self.rollout_dataloader, desc="rollout", disable=not is_logging):
-                rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
+                rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=self._get_meta_info(mode="rollout"))
                 output = self.engine.generate_sequences(prompts=rollout_data)
                 if self.engine.is_mp_src_rank_with_outputs():
                     rollout_responses.extend(output["responses"].tolist())
@@ -312,16 +330,7 @@ class SFTTrainer:
         # Calculate which epoch we're starting from for sampler.set_epoch()
         start_epoch = global_step // self.steps_per_epoch
 
-        meta_info = {
-            "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
-            "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
-            "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
-            "temperature": 1.0,
-            "response_length": 256,
-            "global_batch_size": self.global_batch_size,
-        }
-
-        last_valid_metric = self._validate_rollout(is_logging, meta_info, global_step, tracking)
+        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking)
 
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
@@ -339,7 +348,7 @@ class SFTTrainer:
                 global_step += 1
 
                 # construct tensordict
-                data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
+                data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=self._get_meta_info(mode="train"))
 
                 with self.engine.train_mode():
                     with Timer(name="update_policy", logger=None) as timer:
@@ -397,7 +406,7 @@ class SFTTrainer:
 
                 # early exit or validation step
                 if is_last_step or (self.test_freq > 0 and is_valid_step):
-                    last_valid_metric = self._validate_rollout(is_logging, meta_info, global_step, tracking)
+                    last_valid_metric = self._validate_rollout(is_logging, global_step, tracking)
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     self.ckpt_handler.save_checkpoint(step=global_step)
