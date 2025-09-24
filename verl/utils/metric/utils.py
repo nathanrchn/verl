@@ -66,14 +66,14 @@ def compute_ttr(responses: list[list[int]]) -> float:
         response_without_padding = [token for token in response if token != 3]
         if len(response_without_padding) < 3:
             continue
-        
+
         trigrams = []
         for i in range(len(response_without_padding) - 2):
-            trigram = tuple(response_without_padding[i:i+3])
+            trigram = tuple(response_without_padding[i : i + 3])
             trigrams.append(trigram)
-        
+
         if len(trigrams) > 0:
             output += len(set(trigrams)) / len(trigrams)
-    
+
     valid_responses = sum(1 for response in responses if len([token for token in response if token != 3]) >= 3)
     return output / valid_responses if valid_responses > 0 else 0.0

@@ -118,7 +118,10 @@ class HFModelConfig(BaseConfig):
         # constuct hf_config
         attn_implementation = self.override_config.get("attn_implementation", "flash_attention_2")
         self.hf_config = AutoConfig.from_pretrained(
-            self.local_hf_config_path, trust_remote_code=self.trust_remote_code, attn_implementation=attn_implementation, revision=self.revision
+            self.local_hf_config_path,
+            trust_remote_code=self.trust_remote_code,
+            attn_implementation=attn_implementation,
+            revision=self.revision,
         )
 
         override_config_kwargs = {}

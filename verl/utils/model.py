@@ -68,7 +68,9 @@ def update_model_config(module_config, override_config_kwargs):
             setattr(module_config, key, val)
 
 
-def get_huggingface_actor_config(model_name: str, override_config_kwargs=None, trust_remote_code=False, revision: str = "main") -> dict:
+def get_huggingface_actor_config(
+    model_name: str, override_config_kwargs=None, trust_remote_code=False, revision: str = "main"
+) -> dict:
     if override_config_kwargs is None:
         override_config_kwargs = {}
     assert isinstance(override_config_kwargs, dict), (

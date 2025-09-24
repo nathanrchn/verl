@@ -353,7 +353,11 @@ class FSDPEngine(BaseEngine):
         return optimizer
 
     def _build_lr_scheduler(self, optimizer):
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+        from verl.utils.torch_functional import (
+            get_constant_schedule_with_warmup,
+            get_linear_schedule_with_warmup,
+            get_cosine_schedule_with_warmup,
+        )
 
         optim_config = self.optimizer_config
 
@@ -372,7 +376,9 @@ class FSDPEngine(BaseEngine):
         if warmup_style == "constant":
             lr_scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps)
         elif warmup_style == "linear":
-            lr_scheduler = get_linear_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps)
+            lr_scheduler = get_linear_schedule_with_warmup(
+                optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps
+            )
         elif warmup_style == "cosine":
             lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
@@ -892,8 +898,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=response_length,
-                eos_token_id=[68, 71], # TODO: fix this
-                pad_token_id=3, # TODO: fix this
+                eos_token_id=[68, 71],  # TODO: fix this
+                pad_token_id=3,  # TODO: fix this
                 do_sample=False,
                 use_cache=True,
                 return_dict_in_generate=True,

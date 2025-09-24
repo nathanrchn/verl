@@ -152,7 +152,7 @@ class SFTTrainer:
         if hasattr(config.data, "rollout_files") and config.data.rollout_files is not None:
             if hasattr(config.data, "rollout_max_size") and config.data.rollout_max_size is not None:
                 config.data.max_length = config.data.rollout_max_size
-            
+
             config.data.add_generation_prompt = True
             rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
         else:
@@ -189,8 +189,6 @@ class SFTTrainer:
             pin_memory_device=device_name,
         )
 
-
-
         self.val_sampler = DistributedSampler(
             self.val_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
@@ -226,7 +224,7 @@ class SFTTrainer:
             global_batch_size = self.config.data.val_batch_size
         elif mode == "rollout" and self.config.data.rollout_batch_size is not None:
             global_batch_size = self.config.data.rollout_batch_size
-        
+
         return {
             "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
             "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
@@ -267,7 +265,9 @@ class SFTTrainer:
         if self.rollout_dataloader is not None:
             rollout_responses = []
             for rollout_data in tqdm(self.rollout_dataloader, desc="rollout", disable=not is_logging):
-                rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=self._get_meta_info(mode="rollout"))
+                rollout_data = tu.get_tensordict(
+                    tensor_dict=rollout_data, non_tensor_dict=self._get_meta_info(mode="rollout")
+                )
                 output = self.engine.generate_sequences(prompts=rollout_data)
                 if self.engine.is_mp_src_rank_with_outputs():
                     rollout_responses.extend(output["responses"].tolist())
