@@ -374,10 +374,13 @@ class SFTTrainer:
                     # The loss returned from the engine is an average per-token loss for the local batch.
                     # To get the correct global average loss, we need to scale it by the number of local tokens,
                     # sum it up across all processes, and then divide by the total number of tokens.
-                    local_total_loss = torch.tensor(output["loss"], device=self.device_name, dtype=torch.float32) * output[
-                        "local_batch_tokens"
-                    ]
-                    local_tokens = torch.tensor(output["local_batch_tokens"], device=self.device_name, dtype=torch.float32)
+                    local_total_loss = (
+                        torch.tensor(output["loss"], device=self.device_name, dtype=torch.float32)
+                        * output["local_batch_tokens"]
+                    )
+                    local_tokens = torch.tensor(
+                        output["local_batch_tokens"], device=self.device_name, dtype=torch.float32
+                    )
 
                     global_total_loss = local_total_loss.clone()
                     torch.distributed.all_reduce(
