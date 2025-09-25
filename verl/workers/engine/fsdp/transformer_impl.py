@@ -483,7 +483,7 @@ class FSDPEngine(BaseEngine):
                 if not forward_only:
                     loss.backward()
 
-                losses.append(loss)
+                losses.append(loss.detach())
                 append_to_dict(metrics, meta_info["metrics"])
                 for key, val in meta_info["model_output"].items():
                     if key not in model_output:

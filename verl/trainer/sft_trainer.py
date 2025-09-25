@@ -227,8 +227,8 @@ class SFTTrainer:
         if not self.engine.is_mp_src_rank_with_outputs():
             return None, None
 
-        tokens_tensor = torch.tensor(tokens, device=self.device_name)
-        losses_tensor = torch.tensor(losses, device=self.device_name)
+        tokens_tensor = torch.tensor(tokens, device=self.device_name, dtype=torch.float32)
+        losses_tensor = torch.tensor(losses, device=self.device_name, dtype=torch.float32)
 
         total_loss = torch.sum(losses_tensor * tokens_tensor)
         total_tokens = torch.sum(tokens_tensor)
@@ -374,10 +374,10 @@ class SFTTrainer:
                     # The loss returned from the engine is an average per-token loss for the local batch.
                     # To get the correct global average loss, we need to scale it by the number of local tokens,
                     # sum it up across all processes, and then divide by the total number of tokens.
-                    local_total_loss = (
-                        torch.tensor(output["loss"], device=self.device_name) * output["local_batch_tokens"]
-                    )
-                    local_tokens = torch.tensor(output["local_batch_tokens"], device=self.device_name)
+                    local_total_loss = torch.tensor(output["loss"], device=self.device_name, dtype=torch.float32) * output[
+                        "local_batch_tokens"
+                    ]
+                    local_tokens = torch.tensor(output["local_batch_tokens"], device=self.device_name, dtype=torch.float32)
 
                     global_total_loss = local_total_loss.clone()
                     torch.distributed.all_reduce(
@@ -391,7 +391,11 @@ class SFTTrainer:
                         global_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
                     )
 
-                    loss = (global_total_loss / global_tokens).item()
+                    if global_tokens > 0:
+                        loss = (global_total_loss / global_tokens).item()
+                    else:
+                        # Avoid division by zero if there are no tokens in the batch.
+                        loss = 0.0
                     current_step_tokens = global_tokens.item()
 
                     # MFU calculation requires sequence lengths from the entire global batch
@@ -408,6 +412,7 @@ class SFTTrainer:
                     self.cumulative_tokens += current_step_tokens
 
                     metrics = output["metrics"]
+                    metrics["loss"] = loss
                     metrics["train/loss"] = loss
                     metrics["train/grad_norm"] = metrics.pop("grad_norm")
                     metrics["train/lr"] = lr
