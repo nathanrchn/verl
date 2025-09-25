@@ -330,8 +330,6 @@ class SFTTrainer:
         # Calculate which epoch we're starting from for sampler.set_epoch()
         start_epoch = global_step // self.steps_per_epoch
 
-        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info)
-
         meta_info = {
             "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
             "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
@@ -339,6 +337,8 @@ class SFTTrainer:
             "temperature": 1.0,
             "response_length": 256,
         }
+
+        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info)
 
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
