@@ -367,9 +367,18 @@ class SFTTrainer:
                     sample_count = metrics.pop("sample_count", None)
                     sample_normalizer = metrics.pop("sample_normalizer", None)
 
-                    loss_tensor = torch.tensor(metrics["loss"], device=self.device_name, dtype=torch.float32)
+                    def _to_tensor(value):
+                        if isinstance(value, torch.Tensor):
+                            return value.to(self.device_name, dtype=torch.float32)
+                        if isinstance(value, (list, tuple)):
+                            return torch.tensor(list(value), device=self.device_name, dtype=torch.float32)
+                        if value is None:
+                            return None
+                        return torch.tensor([float(value)], device=self.device_name, dtype=torch.float32)
+
+                    loss_tensor = _to_tensor(metrics["loss"])
                     if token_counts is not None:
-                        weight = torch.tensor(float(token_counts), device=self.device_name, dtype=torch.float32)
+                        weight = _to_tensor(token_counts)
                         weighted_loss = loss_tensor * weight
                         torch.distributed.all_reduce(
                             weighted_loss,
@@ -384,16 +393,16 @@ class SFTTrainer:
                                 op=torch.distributed.ReduceOp.SUM,
                                 group=self.engine.get_data_parallel_group(),
                             )
-                            normalized_total = total_weight.item()
+                            normalized_total = total_weight.sum().item()
                         else:
                             normalized_total = float(token_normalizer)
 
-                        loss = (weighted_loss / normalized_total).item()
+                        loss = (weighted_loss.sum() / normalized_total).item()
                         current_step_tokens = normalized_total
                     else:
                         if sample_count is None:
                             sample_count = data["input_ids"].shape[0]
-                        weight = torch.tensor(float(sample_count), device=self.device_name, dtype=torch.float32)
+                        weight = _to_tensor(sample_count)
                         weighted_loss = loss_tensor * weight
                         torch.distributed.all_reduce(
                             weighted_loss,
@@ -408,11 +417,11 @@ class SFTTrainer:
                                 op=torch.distributed.ReduceOp.SUM,
                                 group=self.engine.get_data_parallel_group(),
                             )
-                            normalized_samples = total_weight.item()
+                            normalized_samples = total_weight.sum().item()
                         else:
                             normalized_samples = float(sample_normalizer)
 
-                        loss = (weighted_loss / normalized_samples).item()
+                        loss = (weighted_loss.sum() / normalized_samples).item()
                         current_step_tokens = normalized_samples
                     self.cumulative_tokens += current_step_tokens
 
@@ -426,9 +435,9 @@ class SFTTrainer:
                     # mfu
                     delta_time = timer.last
                     if token_counts is not None:
-                        batch_seqlens = torch.tensor([float(token_counts)], device=self.device_name)
+                        batch_seqlens = _to_tensor(token_counts)
                     else:
-                        batch_seqlens = torch.tensor([float(sample_count)], device=self.device_name)
+                        batch_seqlens = _to_tensor(sample_count)
 
                     estimated_flops, promised_flops = self.flops_counter.estimate_flops(batch_seqlens, delta_time)
                     metrics["train/mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
