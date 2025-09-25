@@ -222,8 +222,31 @@ class SFTTrainer:
         else:
             self.rollout_dataloader = None
 
-    def _aggregate_losses(self, losses, masks):
-        pass
+    def _scale_and_aggregate_loss_by_tokens(self, losses, tokens):
+        """Scales losses by token counts and aggregates them across a distributed group."""
+        if not self.engine.is_mp_src_rank_with_outputs():
+            return None, None
+
+        tokens_tensor = torch.tensor(tokens, device=self.device_name)
+        losses_tensor = torch.tensor(losses, device=self.device_name)
+
+        total_loss = torch.sum(losses_tensor * tokens_tensor)
+        total_tokens = torch.sum(tokens_tensor)
+
+        # Sum over the data parallel group
+        torch.distributed.all_reduce(
+            total_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
+        )
+        torch.distributed.all_reduce(
+            total_loss, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
+        )
+
+        if total_tokens > 0:
+            avg_loss = total_loss / total_tokens
+        else:
+            avg_loss = torch.tensor(0.0, device=self.device_name)
+
+        return avg_loss, total_tokens
 
     def _validate_rollout(self, is_logging, global_step, tracking, meta_info):
         last_valid_metric = None
@@ -245,24 +268,8 @@ class SFTTrainer:
                     val_entropies.append(torch.sum(entropy * response_mask) / torch.sum(response_mask))
 
         if self.engine.is_mp_src_rank_with_outputs():
-            val_tokens = torch.tensor(val_tokens, device=self.device_name)
-
-            val_loss = torch.sum(torch.tensor(val_losses, device=self.device_name) * val_tokens)
-            val_entropy = torch.sum(torch.tensor(val_entropies, device=self.device_name) * val_tokens)
-
-            # sum over data parallel group
-            torch.distributed.all_reduce(
-                val_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
-            )
-            torch.distributed.all_reduce(
-                val_loss, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
-            )
-            torch.distributed.all_reduce(
-                val_entropy, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
-            )
-
-            val_loss /= val_tokens
-            val_entropy /= val_tokens
+            val_loss, _ = self._scale_and_aggregate_loss_by_tokens(val_losses, val_tokens)
+            val_entropy, _ = self._scale_and_aggregate_loss_by_tokens(val_entropies, val_tokens)
 
         if self.rollout_dataloader is not None:
             rollout_responses = []
@@ -364,48 +371,44 @@ class SFTTrainer:
                 lr = self.engine.lr_scheduler_step()
 
                 if self.engine.is_mp_src_rank_with_outputs():
-                    metrics = output["metrics"]
-
-                    loss = torch.tensor(metrics["loss"], device=self.device_name) * output["local_batch_tokens"]
-
-                    # mean over dp group
-                    batch_seqlens = data["attention_mask"].sum(dim=-1).to(self.device_name)  # (global_bsz // dp)
-
-                    output_tensor = torch.randint(
-                        0,
-                        100,
-                        (batch_seqlens.shape[0] * self.engine.get_data_parallel_size(),),
-                        device=self.device_name,
-                    )  # (global_bsz,)
-
-                    torch.distributed.all_gather_into_tensor(
-                        output_tensor=output_tensor,
-                        input_tensor=batch_seqlens,
-                        group=self.engine.get_data_parallel_group(),
+                    # The loss returned from the engine is an average per-token loss for the local batch.
+                    # To get the correct global average loss, we need to scale it by the number of local tokens,
+                    # sum it up across all processes, and then divide by the total number of tokens.
+                    local_total_loss = (
+                        torch.tensor(output["loss"], device=self.device_name) * output["local_batch_tokens"]
                     )
+                    local_tokens = torch.tensor(output["local_batch_tokens"], device=self.device_name)
 
-                    current_step_tokens = data["response_mask"].sum().to(self.device_name)
+                    global_total_loss = local_total_loss.clone()
                     torch.distributed.all_reduce(
-                        current_step_tokens,
+                        global_total_loss,
                         op=torch.distributed.ReduceOp.SUM,
                         group=self.engine.get_data_parallel_group(),
                     )
 
+                    global_tokens = local_tokens.clone()
                     torch.distributed.all_reduce(
-                        loss, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
+                        global_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
                     )
 
-                    loss /= current_step_tokens
+                    loss = (global_total_loss / global_tokens).item()
+                    current_step_tokens = global_tokens.item()
 
-                    batch_seqlens = output_tensor.tolist()
-                    loss = loss.item()
+                    # MFU calculation requires sequence lengths from the entire global batch
+                    batch_seqlens = data["attention_mask"].sum(dim=-1).to(self.device_name)
+                    global_batch_size = batch_seqlens.shape[0] * self.engine.get_data_parallel_size()
+                    global_batch_seqlens_tensor = torch.empty(
+                        global_batch_size, dtype=batch_seqlens.dtype, device=self.device_name
+                    )
+                    torch.distributed.all_gather_into_tensor(
+                        global_batch_seqlens_tensor, batch_seqlens, group=self.engine.get_data_parallel_group()
+                    )
+                    batch_seqlens = global_batch_seqlens_tensor.tolist()
 
-                    current_step_tokens = current_step_tokens.item()
                     self.cumulative_tokens += current_step_tokens
 
-                    # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
-                    metrics["loss"] = loss
-                    metrics["train/loss"] = metrics.pop("loss")
+                    metrics = output["metrics"]
+                    metrics["train/loss"] = loss
                     metrics["train/grad_norm"] = metrics.pop("grad_norm")
                     metrics["train/lr"] = lr
                     metrics["train/global_tokens"] = current_step_tokens
