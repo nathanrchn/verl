@@ -362,36 +362,58 @@ class SFTTrainer:
                 if self.engine.is_mp_src_rank_with_outputs():
                     metrics = output["metrics"]
 
-                    losses = torch.tensor(metrics["loss"], device=self.device_name)
-                    num_tokens = torch.tensor(metrics.pop("num_tokens"), device=self.device_name)  # remove num_tokens from metrics
-                    if torch.sum(num_tokens) > 0:
-                        loss = torch.sum(losses * num_tokens) / torch.sum(num_tokens)
+                    token_counts = metrics.pop("token_count", None)
+                    token_normalizer = metrics.pop("token_normalizer", None)
+                    sample_count = metrics.pop("sample_count", None)
+                    sample_normalizer = metrics.pop("sample_normalizer", None)
+
+                    loss_tensor = torch.tensor(metrics["loss"], device=self.device_name, dtype=torch.float32)
+                    if token_counts is not None:
+                        weight = torch.tensor(float(token_counts), device=self.device_name, dtype=torch.float32)
+                        weighted_loss = loss_tensor * weight
+                        torch.distributed.all_reduce(
+                            weighted_loss,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=self.engine.get_data_parallel_group(),
+                        )
+
+                        if token_normalizer is None:
+                            total_weight = weight.clone()
+                            torch.distributed.all_reduce(
+                                total_weight,
+                                op=torch.distributed.ReduceOp.SUM,
+                                group=self.engine.get_data_parallel_group(),
+                            )
+                            normalized_total = total_weight.item()
+                        else:
+                            normalized_total = float(token_normalizer)
+
+                        loss = (weighted_loss / normalized_total).item()
+                        current_step_tokens = normalized_total
                     else:
-                        loss = torch.tensor(0.0, device=self.device_name)
+                        if sample_count is None:
+                            sample_count = data["input_ids"].shape[0]
+                        weight = torch.tensor(float(sample_count), device=self.device_name, dtype=torch.float32)
+                        weighted_loss = loss_tensor * weight
+                        torch.distributed.all_reduce(
+                            weighted_loss,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=self.engine.get_data_parallel_group(),
+                        )
 
-                    # mean over dp group
-                    batch_seqlens = data["attention_mask"].sum(dim=-1).to(self.device_name)  # (global_bsz // dp)
+                        if sample_normalizer is None:
+                            total_weight = weight.clone()
+                            torch.distributed.all_reduce(
+                                total_weight,
+                                op=torch.distributed.ReduceOp.SUM,
+                                group=self.engine.get_data_parallel_group(),
+                            )
+                            normalized_samples = total_weight.item()
+                        else:
+                            normalized_samples = float(sample_normalizer)
 
-                    output_tensor = torch.randint(
-                        0,
-                        100,
-                        (batch_seqlens.shape[0] * self.engine.get_data_parallel_size(),),
-                        device=self.device_name,
-                    )  # (global_bsz,)
-
-                    torch.distributed.all_gather_into_tensor(
-                        output_tensor=output_tensor,
-                        input_tensor=batch_seqlens,
-                        group=self.engine.get_data_parallel_group(),
-                    )
-                    torch.distributed.all_reduce(
-                        loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                    )
-
-                    batch_seqlens = output_tensor.tolist()
-                    loss = loss.item()
-
-                    current_step_tokens = output_tensor.sum().item()
+                        loss = (weighted_loss / normalized_samples).item()
+                        current_step_tokens = normalized_samples
                     self.cumulative_tokens += current_step_tokens
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
@@ -403,6 +425,11 @@ class SFTTrainer:
                     metrics["train/cumulative_tokens"] = self.cumulative_tokens
                     # mfu
                     delta_time = timer.last
+                    if token_counts is not None:
+                        batch_seqlens = torch.tensor([float(token_counts)], device=self.device_name)
+                    else:
+                        batch_seqlens = torch.tensor([float(sample_count)], device=self.device_name)
+
                     estimated_flops, promised_flops = self.flops_counter.estimate_flops(batch_seqlens, delta_time)
                     metrics["train/mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
 

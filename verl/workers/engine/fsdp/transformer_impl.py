@@ -455,6 +455,29 @@ class FSDPEngine(BaseEngine):
         else:
             return torch.distributed.group.WORLD
 
+    def _get_token_counts(self, batch: TensorDict) -> torch.Tensor | None:
+        """Return per-sample token counts for loss normalisation if available."""
+
+        def _flatten_and_sum(mask: torch.Tensor) -> torch.Tensor:
+            if mask.dim() == 0:
+                return mask.unsqueeze(0).to(torch.float32)
+            mask = mask.to(torch.float32)
+            leading_dim = mask.shape[0]
+            return mask.reshape(leading_dim, -1).sum(dim=-1)
+
+        for key in ("loss_mask", "response_mask"):
+            if key in batch.keys():
+                mask = batch.get(key)
+                if isinstance(mask, torch.Tensor):
+                    return _flatten_and_sum(mask)
+
+        if "attention_mask" in batch.keys():
+            mask = batch.get("attention_mask")
+            if isinstance(mask, torch.Tensor):
+                return _flatten_and_sum(mask)
+
+        return None
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
@@ -465,6 +488,26 @@ class FSDPEngine(BaseEngine):
 
         output_lst = []
 
+        use_token_norm = False
+        global_batch_size = tu.get_non_tensor_data(data, "global_batch_size", None)
+        token_counts = self._get_token_counts(data)
+        if token_counts is not None and token_counts.numel() > 0:
+            local_total_tokens = token_counts.sum().to(device_name, dtype=torch.float32)
+            total_tokens = local_total_tokens.clone()
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    total_tokens,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.get_data_parallel_group(),
+                )
+            if total_tokens.item() <= 0:
+                raise RuntimeError("Total token count must be positive when token masks are provided.")
+            use_token_norm = True
+        else:
+            if global_batch_size is None:
+                raise RuntimeError("global_batch_size must be provided when token masks are absent.")
+            total_tokens = torch.tensor(float(global_batch_size), device=device_name)
+
         ctx = torch.no_grad() if forward_only else nullcontext()
 
         for micro_batch in micro_batches:
@@ -472,14 +515,31 @@ class FSDPEngine(BaseEngine):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
-                    total_tokens_on_rank = data["response_mask"].sum()
-                    num_tokens_in_micro = micro_batch["response_mask"].sum()
-                    if total_tokens_on_rank > 0:
-                        loss_scale_factor = num_tokens_in_micro / total_tokens_on_rank
-                        loss = loss * loss_scale_factor
+                    metrics_dict = meta_info.get("metrics") if isinstance(meta_info, dict) else None
+                    micro_tokens = None
+
+                    if use_token_norm:
+                        micro_token_counts = self._get_token_counts(micro_batch)
+                        if micro_token_counts is None or micro_token_counts.numel() == 0:
+                            raise RuntimeError(
+                                "Missing token mask in micro-batch while token-based normalisation enabled."
+                            )
+                        micro_tokens = micro_token_counts.sum().to(device_name, dtype=torch.float32)
+                        loss = loss * (micro_tokens / total_tokens)
                     else:
-                        loss = loss * 0
+                        local_micro_bsz = micro_batch["input_ids"].shape[0]
+                        per_rank_batch = global_batch_size / self.get_data_parallel_size()
+                        loss = loss * (local_micro_bsz / per_rank_batch)
+
                     loss.backward()
+
+                    if isinstance(metrics_dict, dict):
+                        if micro_tokens is not None:
+                            metrics_dict["token_count"] = micro_tokens.detach().item()
+                            metrics_dict["token_normalizer"] = total_tokens.detach().item()
+                        else:
+                            metrics_dict["sample_count"] = micro_batch["input_ids"].shape[0]
+                            metrics_dict["sample_normalizer"] = float(global_batch_size)
 
             output_lst.append(meta_info)
 
