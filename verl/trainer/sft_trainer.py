@@ -222,56 +222,52 @@ class SFTTrainer:
         else:
             self.rollout_dataloader = None
 
-    def _get_meta_info(self, mode):
-        global_batch_size = self.global_batch_size
-        if mode == "val" and self.config.data.val_batch_size is not None:
-            global_batch_size = self.config.data.val_batch_size
-        elif mode == "rollout" and self.config.data.rollout_batch_size is not None:
-            global_batch_size = self.config.data.rollout_batch_size
+    def _aggregate_losses(self, losses, masks):
+        pass
 
-        return {
-            "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
-            "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
-            "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
-            "temperature": 1.0,
-            "response_length": 256,
-            "global_batch_size": global_batch_size,
-        }
-
-    def _validate_rollout(self, is_logging, global_step, tracking):
+    def _validate_rollout(self, is_logging, global_step, tracking, meta_info):
         last_valid_metric = None
 
         # Perform validation
         val_losses = []
+        val_tokens = []
         val_entropies = []
         for val_data in tqdm(self.val_dataloader, desc="validation", disable=not is_logging):
             with self.engine.eval_mode():
                 # construct tensordict
-                val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=self._get_meta_info(mode="val"))
+                val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
                 output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
                 if self.engine.is_mp_src_rank_with_outputs():
-                    val_losses.extend(output["metrics"]["loss"])
                     response_mask = val_data["response_mask"].to(self.device_name).to(bool)
+                    val_losses.append(output["loss"])
+                    val_tokens.append(output["local_batch_tokens"])
                     entropy = output["model_output"]["entropy"].to(self.device_name)
                     val_entropies.append(torch.sum(entropy * response_mask) / torch.sum(response_mask))
 
         if self.engine.is_mp_src_rank_with_outputs():
-            val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
-            val_entropy = torch.mean(torch.tensor(val_entropies, device=self.device_name))
-            # average over data parallel group
+            val_tokens = torch.tensor(val_tokens, device=self.device_name)
+
+            val_loss = torch.sum(torch.tensor(val_losses, device=self.device_name) * val_tokens)
+            val_entropy = torch.sum(torch.tensor(val_entropies, device=self.device_name) * val_tokens)
+
+            # sum over data parallel group
             torch.distributed.all_reduce(
-                val_loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                val_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
             )
             torch.distributed.all_reduce(
-                val_entropy, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                val_loss, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
             )
+            torch.distributed.all_reduce(
+                val_entropy, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
+            )
+
+            val_loss /= val_tokens
+            val_entropy /= val_tokens
 
         if self.rollout_dataloader is not None:
             rollout_responses = []
             for rollout_data in tqdm(self.rollout_dataloader, desc="rollout", disable=not is_logging):
-                rollout_data = tu.get_tensordict(
-                    tensor_dict=rollout_data, non_tensor_dict=self._get_meta_info(mode="rollout")
-                )
+                rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
                 output = self.engine.generate_sequences(prompts=rollout_data)
                 if self.engine.is_mp_src_rank_with_outputs():
                     rollout_responses.extend(output["responses"].tolist())
@@ -334,7 +330,15 @@ class SFTTrainer:
         # Calculate which epoch we're starting from for sampler.set_epoch()
         start_epoch = global_step // self.steps_per_epoch
 
-        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking)
+        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info)
+
+        meta_info = {
+            "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
+            "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
+            "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
+            "temperature": 1.0,
+            "response_length": 256,
+        }
 
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
@@ -352,7 +356,7 @@ class SFTTrainer:
                 global_step += 1
 
                 # construct tensordict
-                data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=self._get_meta_info(mode="train"))
+                data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
 
                 with self.engine.train_mode():
                     with Timer(name="update_policy", logger=None) as timer:
@@ -362,67 +366,41 @@ class SFTTrainer:
                 if self.engine.is_mp_src_rank_with_outputs():
                     metrics = output["metrics"]
 
-                    token_counts = metrics.pop("token_count", None)
-                    token_normalizer = metrics.pop("token_normalizer", None)
-                    sample_count = metrics.pop("sample_count", None)
-                    sample_normalizer = metrics.pop("sample_normalizer", None)
+                    loss = torch.tensor(metrics["loss"], device=self.device_name) * output["local_batch_tokens"]
 
-                    def _to_tensor(value):
-                        if isinstance(value, torch.Tensor):
-                            return value.to(self.device_name, dtype=torch.float32)
-                        if isinstance(value, (list, tuple)):
-                            return torch.tensor(list(value), device=self.device_name, dtype=torch.float32)
-                        if value is None:
-                            return None
-                        return torch.tensor([float(value)], device=self.device_name, dtype=torch.float32)
+                    # mean over dp group
+                    batch_seqlens = data["attention_mask"].sum(dim=-1).to(self.device_name)  # (global_bsz // dp)
 
-                    loss_tensor = _to_tensor(metrics["loss"])
-                    if token_counts is not None:
-                        weight = _to_tensor(token_counts)
-                        weighted_loss = loss_tensor * weight
-                        torch.distributed.all_reduce(
-                            weighted_loss,
-                            op=torch.distributed.ReduceOp.SUM,
-                            group=self.engine.get_data_parallel_group(),
-                        )
+                    output_tensor = torch.randint(
+                        0,
+                        100,
+                        (batch_seqlens.shape[0] * self.engine.get_data_parallel_size(),),
+                        device=self.device_name,
+                    )  # (global_bsz,)
 
-                        if token_normalizer is None:
-                            total_weight = weight.clone()
-                            torch.distributed.all_reduce(
-                                total_weight,
-                                op=torch.distributed.ReduceOp.SUM,
-                                group=self.engine.get_data_parallel_group(),
-                            )
-                            normalized_total = total_weight.sum().item()
-                        else:
-                            normalized_total = float(token_normalizer)
+                    torch.distributed.all_gather_into_tensor(
+                        output_tensor=output_tensor,
+                        input_tensor=batch_seqlens,
+                        group=self.engine.get_data_parallel_group(),
+                    )
 
-                        loss = (weighted_loss.sum() / normalized_total).item()
-                        current_step_tokens = normalized_total
-                    else:
-                        if sample_count is None:
-                            sample_count = data["input_ids"].shape[0]
-                        weight = _to_tensor(sample_count)
-                        weighted_loss = loss_tensor * weight
-                        torch.distributed.all_reduce(
-                            weighted_loss,
-                            op=torch.distributed.ReduceOp.SUM,
-                            group=self.engine.get_data_parallel_group(),
-                        )
+                    current_step_tokens = data["response_mask"].sum().to(self.device_name)
+                    torch.distributed.all_reduce(
+                        current_step_tokens,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=self.engine.get_data_parallel_group(),
+                    )
 
-                        if sample_normalizer is None:
-                            total_weight = weight.clone()
-                            torch.distributed.all_reduce(
-                                total_weight,
-                                op=torch.distributed.ReduceOp.SUM,
-                                group=self.engine.get_data_parallel_group(),
-                            )
-                            normalized_samples = total_weight.sum().item()
-                        else:
-                            normalized_samples = float(sample_normalizer)
+                    torch.distributed.all_reduce(
+                        loss, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
+                    )
 
-                        loss = (weighted_loss.sum() / normalized_samples).item()
-                        current_step_tokens = normalized_samples
+                    loss /= current_step_tokens
+
+                    batch_seqlens = output_tensor.tolist()
+                    loss = loss.item()
+
+                    current_step_tokens = current_step_tokens.item()
                     self.cumulative_tokens += current_step_tokens
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
@@ -434,11 +412,6 @@ class SFTTrainer:
                     metrics["train/cumulative_tokens"] = self.cumulative_tokens
                     # mfu
                     delta_time = timer.last
-                    if token_counts is not None:
-                        batch_seqlens = _to_tensor(token_counts)
-                    else:
-                        batch_seqlens = _to_tensor(sample_count)
-
                     estimated_flops, promised_flops = self.flops_counter.estimate_flops(batch_seqlens, delta_time)
                     metrics["train/mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
 
@@ -451,7 +424,7 @@ class SFTTrainer:
 
                 # early exit or validation step
                 if is_last_step or (self.test_freq > 0 and is_valid_step):
-                    last_valid_metric = self._validate_rollout(is_logging, global_step, tracking)
+                    last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info)
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     self.ckpt_handler.save_checkpoint(step=global_step)

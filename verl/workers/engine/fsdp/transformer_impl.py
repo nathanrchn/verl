@@ -29,6 +29,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from verl.utils.seqlen_balancing import restore_dynamic_batch
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.utils import tensordict_utils as tu
@@ -58,7 +59,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
-from verl.utils.py_functional import convert_to_regular_types
+from verl.utils.py_functional import convert_to_regular_types, append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -72,7 +73,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 
 from ..base import BaseEngine, EngineRegistry
-from ..utils import postprocess_batch_func, prepare_micro_batches
+from ..utils import prepare_micro_batches
 from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
@@ -455,96 +456,53 @@ class FSDPEngine(BaseEngine):
         else:
             return torch.distributed.group.WORLD
 
-    def _get_token_counts(self, batch: TensorDict) -> torch.Tensor | None:
-        """Return per-sample token counts for loss normalisation if available."""
-
-        def _flatten_and_sum(mask: torch.Tensor) -> torch.Tensor:
-            if mask.dim() == 0:
-                return mask.unsqueeze(0).to(torch.float32)
-            mask = mask.to(torch.float32)
-            leading_dim = mask.shape[0]
-            return mask.reshape(leading_dim, -1).sum(dim=-1)
-
-        for key in ("loss_mask", "response_mask"):
-            if key in batch.keys():
-                mask = batch.get(key)
-                if isinstance(mask, torch.Tensor):
-                    return _flatten_and_sum(mask)
-
-        if "attention_mask" in batch.keys():
-            mask = batch.get("attention_mask")
-            if isinstance(mask, torch.Tensor):
-                return _flatten_and_sum(mask)
-
-        return None
-
-    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> TensorDict:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+        use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+
+        local_batch_tokens = data["response_mask"].sum().to(get_device_name())
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
-        output_lst = []
-
-        use_token_norm = False
-        global_batch_size = tu.get_non_tensor_data(data, "global_batch_size", None)
-        token_counts = self._get_token_counts(data)
-        if token_counts is not None and token_counts.numel() > 0:
-            local_total_tokens = token_counts.sum().to(device_name, dtype=torch.float32)
-            total_tokens = local_total_tokens.clone()
-            if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(
-                    total_tokens,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=self.get_data_parallel_group(),
-                )
-            if total_tokens.item() <= 0:
-                raise RuntimeError("Total token count must be positive when token masks are provided.")
-            use_token_norm = True
-        else:
-            if global_batch_size is None:
-                raise RuntimeError("global_batch_size must be provided when token masks are absent.")
-            total_tokens = torch.tensor(float(global_batch_size), device=device_name)
-
         ctx = torch.no_grad() if forward_only else nullcontext()
 
+        losses = []
+        metrics = {}
+        model_output = {}
         for micro_batch in micro_batches:
             with ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
+                local_micro_batch_tokens = micro_batch["response_mask"].sum().to(get_device_name())
+                loss_scale_factor = local_micro_batch_tokens / local_batch_tokens
+                loss = loss * loss_scale_factor
+
                 if not forward_only:
-                    metrics_dict = meta_info.get("metrics") if isinstance(meta_info, dict) else None
-                    micro_tokens = None
-
-                    if use_token_norm:
-                        micro_token_counts = self._get_token_counts(micro_batch)
-                        if micro_token_counts is None or micro_token_counts.numel() == 0:
-                            raise RuntimeError(
-                                "Missing token mask in micro-batch while token-based normalisation enabled."
-                            )
-                        micro_tokens = micro_token_counts.sum().to(device_name, dtype=torch.float32)
-                        loss = loss * (micro_tokens / total_tokens)
-                    else:
-                        local_micro_bsz = micro_batch["input_ids"].shape[0]
-                        per_rank_batch = global_batch_size / self.get_data_parallel_size()
-                        loss = loss * (local_micro_bsz / per_rank_batch)
-
                     loss.backward()
 
-                    if isinstance(metrics_dict, dict):
-                        if micro_tokens is not None:
-                            metrics_dict["token_count"] = micro_tokens.detach().item()
-                            metrics_dict["token_normalizer"] = total_tokens.detach().item()
-                        else:
-                            metrics_dict["sample_count"] = micro_batch["input_ids"].shape[0]
-                            metrics_dict["sample_normalizer"] = float(global_batch_size)
+                losses.append(loss)
+                append_to_dict(metrics, meta_info["metrics"])
+                for key, val in meta_info["model_output"].items():
+                    if key not in model_output:
+                        model_output[key] = []
+                    model_output[key].append(val)
 
-            output_lst.append(meta_info)
+        for key, val in model_output.items():
+            model_output[key] = torch.cat(model_output[key], dim=0)
+            # reverse with dynamic bsz
+            if use_dynamic_bsz:
+                model_output[key] = restore_dynamic_batch(model_output[key], indices)
 
-        # postprocess and return
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        loss = torch.sum(torch.tensor(losses, device=get_device_name()))
+        return {
+            "loss": loss.item(),
+            "metrics": metrics,
+            "model_output": model_output,
+            "local_batch_tokens": local_batch_tokens.item(),
+        }
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
