@@ -73,7 +73,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 
 from ..base import BaseEngine, EngineRegistry
-from ..utils import prepare_micro_batches
+from ..utils import postprocess_batch_func, prepare_micro_batches
 from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
@@ -459,9 +459,6 @@ class FSDPEngine(BaseEngine):
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> TensorDict:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
-        use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
-
-        local_batch_tokens = data["response_mask"].sum().to(get_device_name())
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
@@ -469,40 +466,18 @@ class FSDPEngine(BaseEngine):
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
-        losses = []
-        metrics = {}
-        model_output = {}
+        output_lst = []
         for micro_batch in micro_batches:
             with ctx:
+                tu.assign_non_tensor(micro_batch, num_micro_batch=len(micro_batches))
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
-
-                local_micro_batch_tokens = micro_batch["response_mask"].sum().to(get_device_name())
-                loss_scale_factor = local_micro_batch_tokens / local_batch_tokens
-                loss = loss * loss_scale_factor
 
                 if not forward_only:
                     loss.backward()
 
-                losses.append(loss.detach())
-                append_to_dict(metrics, meta_info["metrics"])
-                for key, val in meta_info["model_output"].items():
-                    if key not in model_output:
-                        model_output[key] = []
-                    model_output[key].append(val)
+            output_lst.append(meta_info)
 
-        for key, val in model_output.items():
-            model_output[key] = torch.cat(model_output[key], dim=0)
-            # reverse with dynamic bsz
-            if use_dynamic_bsz:
-                model_output[key] = restore_dynamic_batch(model_output[key], indices)
-
-        loss = torch.sum(torch.tensor(losses, device=get_device_name()))
-        return {
-            "loss": loss.item(),
-            "metrics": metrics,
-            "model_output": model_output,
-            "local_batch_tokens": local_batch_tokens.item(),
-        }
+        return postprocess_batch_func(output_lst, indices, data)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
@@ -771,7 +746,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         temperature = micro_batch["temperature"]
-        calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=True)
+        calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
 
         input_ids = micro_batch["input_ids"]
         batch_size, seqlen = input_ids.shape

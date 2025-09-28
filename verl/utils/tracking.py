@@ -18,10 +18,14 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import json
 import os
+import subprocess
+import time
 from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+SYNC_INTERVAL = 30  # seconds
 
 
 class Tracking:
@@ -59,6 +63,8 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self.last_sync_time = time.time()
+        self.default_local_dir = config.trainer.default_local_dir
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import wandb
@@ -66,7 +72,14 @@ class Tracking:
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
-            wandb.init(project=project_name, name=experiment_name, config=config, settings=settings)
+            wandb.init(
+                project=project_name,
+                dir=self.default_local_dir,
+                name=experiment_name,
+                config=config,
+                settings=settings,
+                mode="offline",
+            )
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:
@@ -151,6 +164,10 @@ class Tracking:
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
+
+        if "wandb" in self.logger and time.time() - self.last_sync_time > SYNC_INTERVAL:
+            subprocess.run(["wandb", "sync", self.default_local_dir], check=True)
+            self.last_sync_time = time.time()
 
     def __del__(self):
         if "wandb" in self.logger:

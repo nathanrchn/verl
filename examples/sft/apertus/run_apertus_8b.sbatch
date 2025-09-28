@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --partition=normal
 #SBATCH --environment=nccl
 #SBATCH --output=logs/%j/log.out
@@ -29,16 +29,17 @@ TOKENIZER_PATH="swiss-ai/Apertus-8B-Instruct-2509"
 MODEL_DTYPE="bf16"
 
 # Data configuration
-MICRO_BATCH_SIZE_PER_GPU=32
+MICRO_BATCH_SIZE_PER_GPU=16
 MAX_LENGTH=4096
-TRAIN_BATCH_SIZE=32
+TRAIN_BATCH_SIZE=512
 VAL_BATCH_SIZE=256
 ROLLOUT_BATCH_SIZE=256
 ROLLOUT_MAX_LENGTH=512
-MAX_TOKEN_LEN_PER_GPU=8192 # 65536
 TRAIN_FILE="train.parquet"
 VAL_FILE="val.parquet"
 ROLLOUT_FILE="rollout.parquet"
+USE_DYNAMIC_BSZ=false
+MAX_TOKEN_LEN_PER_GPU=65536
 
 # Training configuration
 LEARNING_RATE="5e-6"
@@ -49,7 +50,7 @@ TEST_FREQ=128
 TOTAL_TRAINING_STEPS=null
 
 # Experiment configuration
-PROJECT_NAME="apertus-sft-ablations"
+PROJECT_NAME="apertus-sft-bs-issue"
 
 # Multi-turn configuration
 ENABLE_MULTITURN=true
@@ -113,6 +114,7 @@ torchrun --nnodes=${SLURM_NNODES} --nproc_per_node=4 --node_rank=${local_rank} -
     data.val_batch_size=$VAL_BATCH_SIZE \
     data.rollout_batch_size=$ROLLOUT_BATCH_SIZE \
     +data.rollout_max_size=$ROLLOUT_MAX_LENGTH \
+    data.use_dynamic_bsz=$USE_DYNAMIC_BSZ \
     data.max_token_len_per_gpu=$MAX_TOKEN_LEN_PER_GPU \
     +data.apply_chat_template_kwargs.truncation=true \
     +data.add_generation_prompt=false \
