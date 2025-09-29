@@ -15,12 +15,13 @@
 The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
+import asyncio
 import gc
 import logging
 import os
 import warnings
 from contextlib import nullcontext
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.distributed
@@ -28,6 +29,13 @@ import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+
+try:
+    # for torch 2.5+
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
 
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 import verl.utils.torch_functional as verl_F
@@ -42,12 +50,14 @@ from verl.utils.device import (
     get_torch_device,
     is_cuda_available,
     is_npu_available,
+    set_expandable_segments,
 )
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
     MixedPrecisionPolicy,
     apply_fsdp2,
+    collect_lora_params,
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
     fsdp_version,
@@ -58,7 +68,10 @@ from verl.utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
+    replace_lora_wrapper,
 )
+from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.model import convert_weight_keys
 from verl.utils.py_functional import convert_to_regular_types, append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
@@ -70,7 +83,7 @@ elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
 from verl.trainer.config import CheckpointConfig
-from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
+from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig, RolloutConfig
 
 from ..base import BaseEngine, EngineRegistry
 from ..utils import postprocess_batch_func, prepare_micro_batches
@@ -95,6 +108,7 @@ class FSDPEngine(BaseEngine):
         engine_config: FSDPEngineConfig,
         optimizer_config: FSDPOptimizerConfig,
         checkpoint_config: CheckpointConfig,
+        rollout_config: Optional[RolloutConfig] = None,
     ):
         """
         Initialize the FSDPEngine.
@@ -110,6 +124,7 @@ class FSDPEngine(BaseEngine):
         self.engine_config = engine_config
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
+        self.rollout_config = rollout_config
 
         self.mode = None
 
@@ -168,6 +183,8 @@ class FSDPEngine(BaseEngine):
             checkpoint_config=self.checkpoint_config,
         )
 
+        self.rollout_engine = self._build_rollout_engine()
+
     def _init_device_mesh(self):
         world_size = torch.distributed.get_world_size()
         from torch.distributed.device_mesh import init_device_mesh
@@ -185,6 +202,11 @@ class FSDPEngine(BaseEngine):
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+
+        # Rollout-related variables
+        self.base_sync_done = True  # Will be set properly when rollout is built
+        self.torch_random_states = None
+        self.gen_random_states = None
 
     def _get_torch_dtype(self):
         from verl.utils.torch_dtypes import PrecisionType
@@ -438,6 +460,67 @@ class FSDPEngine(BaseEngine):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
 
+    def _build_rollout_engine(self):
+        if self.rollout_config is None:
+            return None
+
+        from torch.distributed.device_mesh import init_device_mesh
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.rollout import get_rollout_class
+
+        # 1. parse rollout config
+        if hasattr(self.rollout_config, "tensor_model_parallel_size"):
+            # Already parsed config object
+            rollout_config = self.rollout_config
+        else:
+            # Omega conf that needs parsing
+            rollout_config = omega_conf_to_dataclass(self.rollout_config)
+
+        # 2. build rollout device mesh
+        infer_tp = rollout_config.tensor_model_parallel_size
+        world_size = torch.distributed.get_world_size()
+        dp = world_size // infer_tp
+        assert world_size % infer_tp == 0, f"rollout world_size: {world_size} is not divisible by infer_tp: {infer_tp}"
+        rollout_device_mesh = init_device_mesh(
+            device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
+        )
+
+        # 3. init trainer and rollout random states
+        self.torch_random_states = get_torch_device().get_rng_state()
+        gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
+        get_torch_device().manual_seed(gen_dp_rank + 1000)  # make sure all tp ranks have the same random states
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
+
+        # 4. build rollout model
+        log_gpu_memory_usage(f"Before building {rollout_config.name} rollout", logger=logger)
+        rollout_engine = get_rollout_class(rollout_config.name, rollout_config.mode)(
+            config=rollout_config, model_config=self.model_config, device_mesh=rollout_device_mesh
+        )
+        log_gpu_memory_usage(f"After building {rollout_config.name} rollout", logger=logger)
+
+        # Full params for FSDP state dict handling
+        if torch.distributed.get_world_size() == 1 and fsdp_version(self.module) == 1:
+            FSDP.set_state_dict_type(
+                self.module,
+                state_dict_type=StateDictType.FULL_STATE_DICT,
+                state_dict_config=FullStateDictConfig(),
+            )
+        elif fsdp_version(self.module) == 1:
+            FSDP.set_state_dict_type(
+                self.module,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            )
+
+        # used for LoRA
+        self.base_sync_done = (
+            "dummy" not in rollout_config.load_format if hasattr(rollout_config, "load_format") else True
+        )
+        # TODO: Add VLLM_SLEEP_LEVEL and layered_summon logic if needed
+
+        return rollout_engine
+
     def train_mode(self):
         """
         Return a context manager that switches to training mode with FSDP-specific handling.
@@ -534,6 +617,95 @@ class FSDPEngine(BaseEngine):
         self.lr_scheduler.step()
         lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
         return lr
+
+    async def rollout_mode(self):
+        """Context switch hybridengine to rollout mode."""
+        if not self.use_rollout_engine or self.rollout_engine is None:
+            return
+
+        aggressive_empty_cache(force_sync=True)
+
+        log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.module)
+        log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
+
+        peft_config = None
+        peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        if hasattr(peft_model, "peft_config"):  # LoRA
+            peft_config = peft_model.peft_config.get("default", None)
+            params = collect_lora_params(
+                module=self.module,
+                layered_summon=False,  # TODO: Add config support if needed
+                base_sync_done=self.base_sync_done,
+            )
+            if not self.base_sync_done:
+                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+        else:
+            params = self.module.state_dict()
+
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+
+        log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.module)
+        log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+
+        set_expandable_segments(False)
+
+        if peft_config is not None and self.base_sync_done:
+            per_tensor_param = params
+        else:
+            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+            per_tensor_param = (
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in params.items()
+            )
+
+        if hasattr(self.rollout_engine, "free_cache_engine") and getattr(
+            self.rollout_config, "free_cache_engine", False
+        ):
+            await self.rollout_engine.resume(tags=["weights"])
+        log_gpu_memory_usage("After resume weights", logger=logger)
+        await self.rollout_engine.update_weights(
+            per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done
+        )
+        log_gpu_memory_usage("After update_weights", logger=logger)
+        del params, per_tensor_param
+        aggressive_empty_cache(force_sync=True)
+        if hasattr(self.rollout_engine, "free_cache_engine") and getattr(
+            self.rollout_config, "free_cache_engine", False
+        ):
+            await self.rollout_engine.resume(tags=["kv_cache"])
+        log_gpu_memory_usage("After resume kv_cache", logger=logger)
+
+        self.base_sync_done = True  # TODO: Add force_reload support if needed
+        # important: need to manually set the random states of each tp to be identical.
+        self.torch_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.gen_random_states)
+
+    async def trainer_mode(self):
+        """Context switch hybridengine to trainer mode."""
+        if not self.use_rollout_engine or self.rollout_engine is None:
+            return
+
+        if hasattr(self.rollout_engine, "free_cache_engine") and getattr(
+            self.rollout_config, "free_cache_engine", False
+        ):
+            log_gpu_memory_usage("Before rollout offload", logger=logger)
+            await self.rollout_engine.release()
+            log_gpu_memory_usage("After rollout offload", logger=logger)
+
+        self.module.train()
+
+        # add empty cache after each compute
+        aggressive_empty_cache(force_sync=True)
+
+        set_expandable_segments(True)
+
+        # restore random states
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
 
     def to(self, device: str, model: bool = True, optimizer: bool = True):
         """
@@ -891,6 +1063,42 @@ class FSDPEngineWithLMHead(FSDPEngine):
             return loss, output
 
     def generate_sequences(self, prompts: TensorDict) -> TensorDict:
+        if self.rollout_engine is not None:
+            return self._generate_with_rollout_engine(prompts)
+        else:
+            return self._generate_with_hf_model(prompts)
+
+    def _generate_with_rollout_engine(self, prompts: TensorDict) -> TensorDict:
+        prompts = prompts.to(get_device_id())
+
+        meta_info = {
+            "eos_token_id": self.model_config.generation_config.eos_token_id
+            if self.model_config.generation_config is not None
+            else self.model_config.tokenizer.eos_token_id,
+            "pad_token_id": self.model_config.generation_config.pad_token_id
+            if self.model_config.generation_config is not None
+            else self.model_config.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+
+        # Switch to rollout mode
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.rollout_mode())
+        log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+
+        # Generate using rollout engine
+        output = self.rollout_engine.generate_sequences(prompts=prompts)
+
+        # Switch back to trainer mode
+        loop.run_until_complete(self.trainer_mode())
+        log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+
+        output = output.to("cpu")
+        # clear kv cache
+        get_torch_device().empty_cache()
+        return output
+
+    def _generate_with_hf_model(self, prompts: TensorDict) -> TensorDict:
         device_name = get_device_name()
         response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
 

@@ -110,17 +110,35 @@ class SFTTrainer:
         self.optimizer_config = omega_conf_to_dataclass(self.config.optim)
         self.checkpoint_config = omega_conf_to_dataclass(self.config.checkpoint)
 
+        # Check if rollout is enabled and build rollout config
+        self.use_rollout = getattr(self.config, "use_rollout", False)
+        if self.use_rollout and hasattr(self.config, "rollout"):
+            self.rollout_config = omega_conf_to_dataclass(self.config.rollout)
+        else:
+            self.rollout_config = None
+
     def _build_engine(self):
         from verl.workers.engine import BaseEngine, EngineRegistry
 
-        self.engine: BaseEngine = EngineRegistry.new(
-            model_type="language_model",
-            backend=self.engine_config.strategy,
-            model_config=self.model_config,
-            engine_config=self.engine_config,
-            optimizer_config=self.optimizer_config,
-            checkpoint_config=self.checkpoint_config,
-        )
+        # Prepare engine creation arguments
+        engine_args = {
+            "model_type": "language_model",
+            "backend": self.engine_config.strategy,
+            "model_config": self.model_config,
+            "engine_config": self.engine_config,
+            "optimizer_config": self.optimizer_config,
+            "checkpoint_config": self.checkpoint_config,
+        }
+
+        # Add rollout configuration if enabled
+        if self.use_rollout and self.rollout_config is not None:
+            engine_args["use_rollout_engine"] = True
+            engine_args["rollout_config"] = self.rollout_config
+
+            if self.rank == 0:
+                print(f"SFT Trainer: Rollout engine enabled with config: {self.rollout_config}")
+
+        self.engine: BaseEngine = EngineRegistry.new(**engine_args)
 
     def _init_engine(self):
         # patch optimizer config
