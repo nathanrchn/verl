@@ -64,7 +64,7 @@ class Tracking:
 
         self.logger = {}
         self.last_sync_time = time.time()
-        self.default_local_dir = config.trainer.default_local_dir
+        self.default_local_dir = config["trainer"]["default_local_dir"]
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import wandb
@@ -166,7 +166,9 @@ class Tracking:
                 logger_instance.log(data=data, step=step)
 
         if "wandb" in self.logger and time.time() - self.last_sync_time > SYNC_INTERVAL:
-            subprocess.run(["wandb", "sync", self.default_local_dir], check=True)
+            wandb_dir = os.path.join(self.default_local_dir, "wandb")
+            run_dir = os.path.join(wandb_dir, [d for d in os.listdir(wandb_dir) if d.startswith("offline")][0])
+            subprocess.Popen(["wandb", "sync", run_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.last_sync_time = time.time()
 
     def __del__(self):

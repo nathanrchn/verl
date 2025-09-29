@@ -459,7 +459,13 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
         self.only_tools_special_tokens = config.get("only_tools_special_tokens", False)
 
     def _special_tokens_mask(self, input_ids: np.ndarray) -> np.ndarray:
-        return (input_ids == END_ASSISTANT_TOKEN) | (input_ids == INNER_TOKEN) | (input_ids == OUTER_TOKEN)
+        return (
+            (input_ids == END_ASSISTANT_TOKEN)
+            | (input_ids == INNER_TOKEN)
+            | (input_ids == OUTER_TOKEN)
+            | (input_ids == TOOL_CALLS_TOKEN)
+            | (input_ids == END_TOOL_CALLS_TOKEN)
+        )
 
     def __getitem__(self, item):
         tokenizer = self.tokenizer

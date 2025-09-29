@@ -229,10 +229,15 @@ class SFTTrainer:
         val_losses = []
         val_entropies = []
         for val_data in tqdm(self.val_dataloader, desc="validation", disable=not is_logging):
+            total_tokens = val_data["response_mask"].sum().to(self.device_name)
+            torch.distributed.all_reduce(
+                total_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
+            )
             with self.engine.eval_mode():
                 # construct tensordict
                 val_data = tu.get_tensordict(
-                    tensor_dict=val_data, non_tensor_dict={**meta_info, "calculate_entropy": True}
+                    tensor_dict=val_data,
+                    non_tensor_dict={**meta_info, "calculate_entropy": True, "total_tokens": total_tokens.item()},
                 )
                 output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
                 if self.engine.is_mp_src_rank_with_outputs():
@@ -350,7 +355,7 @@ class SFTTrainer:
                 torch.distributed.all_reduce(
                     total_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
                 )
-                data["total_tokens"] = total_tokens
+                tu.assign_non_tensor(data, total_tokens=total_tokens.item())
 
                 with self.engine.train_mode():
                     with Timer(name="update_policy", logger=None) as timer:
