@@ -186,17 +186,19 @@ class FSDPEngine(BaseEngine):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-    def _build_module(self):
-        from verl.utils.model import get_hf_auto_model_class
+    def _get_torch_dtype(self):
         from verl.utils.torch_dtypes import PrecisionType
 
         torch_dtype = self.engine_config.model_dtype
-
         if torch_dtype is None:
             # if it is training, we force torch_dtype to fp32
             torch_dtype = torch.float32 if not self.engine_config.forward_only else torch.bfloat16
+        return PrecisionType.to_dtype(torch_dtype)
 
-        torch_dtype = PrecisionType.to_dtype(torch_dtype)
+    def _build_module(self):
+        from verl.utils.model import get_hf_auto_model_class
+
+        torch_dtype = self._get_torch_dtype()
 
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
@@ -343,15 +345,26 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_optimizer(self, module):
-        from torch import optim
+        torch_dtype = self._get_torch_dtype()
 
-        optimizer = optim.AdamW(
+        if torch_dtype == torch.bfloat16:
+            from torchao.optim import _AdamW
+
+            optimizer_cls = _AdamW
+            kwargs = {"bf16_stochastic_round": True}
+        else:
+            from torch.optim import AdamW
+
+            optimizer_cls = AdamW
+            kwargs = {}
+
+        return optimizer_cls(
             module.parameters(),
             lr=self.optimizer_config.lr,
             betas=self.optimizer_config.betas,
             weight_decay=self.optimizer_config.weight_decay,
+            **kwargs,
         )
-        return optimizer
 
     def _build_lr_scheduler(self, optimizer):
         from verl.utils.torch_functional import (

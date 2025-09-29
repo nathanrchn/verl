@@ -363,7 +363,9 @@ class SFTTrainer:
                 lr = self.engine.lr_scheduler_step()
 
                 if self.engine.is_mp_src_rank_with_outputs():
-                    loss = torch.mean(torch.tensor(output["loss"], device=self.device_name))
+                    output_metrics = output["metrics"]
+
+                    loss = torch.mean(torch.tensor(output_metrics["loss"], device=self.device_name))
                     torch.distributed.all_reduce(
                         loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
                     )
@@ -382,7 +384,7 @@ class SFTTrainer:
 
                     metrics = {}
                     metrics["train/loss"] = loss.item()
-                    metrics["train/grad_norm"] = output["metrics"]["grad_norm"]
+                    metrics["train/grad_norm"] = output_metrics["grad_norm"]
                     metrics["train/lr"] = lr
                     metrics["train/global_tokens"] = total_tokens.item()
                     metrics["train/cumulative_tokens"] = self.cumulative_tokens
