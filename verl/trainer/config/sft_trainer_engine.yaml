@@ -73,12 +73,4 @@ trainer:
   resume_from_path: null  
   device: cuda
 
-use_rollout: false
-
-rollout:
-  _target_: verl.workers.config.RolloutConfig
-  name: "sglang"
-  mode: "sync"
-  tensor_model_parallel_size: 1
-  free_cache_engine: true
-  load_format: "auto"
+rollout_url: null
