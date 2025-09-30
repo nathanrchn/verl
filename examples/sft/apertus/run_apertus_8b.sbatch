@@ -63,6 +63,7 @@ CUSTOM_CLS_NAME="ApertusSFTDataset"
 
 # Rollout
 USE_ROLLOUT=true
+ROLLOUT_MODEL_PATH="swiss-ai/Apertus-8B-Instruct-2509"
 
 # Logging
 LOGGER='["console","wandb"]'
@@ -81,7 +82,17 @@ dataset_path=$DATASET_PATH
 mkdir -p "$save_path"
 cp "$0" "$save_path/run_apertus_8b.sbatch"
 
-for local_rank in $(seq 0 $((SLURM_NNODES - 1))); do
+if [ "$USE_ROLLOUT" = true ]; then
+    rollout_node=${nodes[-1]}
+    TRAINING_NODES=$((SLURM_NNODES - 1))
+    ROLLOUT_URL="http://${rollout_node}:60001"
+else
+    TRAINING_NODES=$SLURM_NNODES
+    ROLLOUT_URL=null
+fi
+
+
+for local_rank in $(seq 0 $((TRAINING_NODES - 1))); do
     node=${nodes[$local_rank]}
 
     srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --output=$save_path/node_${local_rank}.log --error=$save_path/node_${local_rank}.err \
@@ -94,8 +105,6 @@ export NO_PROXY="0.0.0.0,$NO_PROXY"
 export NCCL_NET="ofi"
 export NCCL_DEBUG=INFO
 export HYDRA_FULL_ERROR=1
-export SGLANG_HOST_IP=$head_node
-export SGLANG_PORT=60000
 
 pip install --upgrade pip setuptools wheel --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
 pip install git+https://github.com/huggingface/transformers.git --no-deps --retries 3 --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
@@ -134,7 +143,7 @@ torchrun --nnodes=$SLURM_NNODES --nproc_per_node=4 --node_rank=$local_rank --mas
     optim.warmup_style=$WARMUP_STYLE \
     optim.weight_decay=$WEIGHT_DECAY \
     optim.lr_warmup_steps_ratio=$LR_WARMUP_STEPS_RATIO \
-    use_rollout=$USE_ROLLOUT \
+    rollout_url=$ROLLOUT_URL \
     checkpoint.save_contents='["model","optimizer","extra","hf_model"]' \
     trainer.default_local_dir=$save_path \
     trainer.project_name=$PROJECT_NAME \
@@ -144,6 +153,21 @@ torchrun --nnodes=$SLURM_NNODES --nproc_per_node=4 --node_rank=$local_rank --mas
     trainer.total_epochs=$TOTAL_EPOCHS \
     trainer.logger=$LOGGER" &
 done
+
+if [ "$USE_ROLLOUT" = true ]; then
+    srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --output=$save_path/node_rollout.log --error=$save_path/node_rollout.err \
+        bash --norc --noprofile -c "\
+set -x
+
+export no_proxy="0.0.0.0,$no_proxy"
+export NO_PROXY="0.0.0.0,$NO_PROXY"
+
+export NCCL_NET="ofi"
+export NCCL_DEBUG=INFO
+
+python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --host=0.0.0.0 --port=60001 --decode-log-interval 1 --skip-server-warmup --random-seed 42
+"
+fi
 
 wait
 

@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import asyncio
 import warnings
 from urllib.parse import urlparse
 from contextlib import nullcontext
@@ -29,10 +30,18 @@ import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+
+try:
+    # for torch 2.5+
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.utils import tensordict_utils as tu
+from verl.utils.model import convert_weight_keys
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
@@ -59,11 +68,12 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
-from verl.utils.py_functional import convert_to_regular_types, append_to_dict
+from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.rollout.sglang_rollout.http_server_engine import HttpServerAdapter
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -115,7 +125,7 @@ class FSDPEngine(BaseEngine):
 
         self.rollout_url = rollout_url
         self.use_rollout_engine = self.rollout_url is not None
-        
+
         self.mode = None
 
         self.rank = torch.distributed.get_rank()
@@ -910,9 +920,37 @@ class FSDPEngineWithLMHead(FSDPEngine):
         else:
             return self._generate_sequences_with_fsdp_engine(prompts)
 
+    async def _update_rollout_engine(self):
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.module)
+
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.module)
+
+        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+        per_tensor_param = (
+            (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+            for name, param in params.items()
+        )
+
+        update_weights_bucket_bytes = int(512) << 20
+        for params_batch in get_named_tensor_buckets(per_tensor_param, update_weights_bucket_bytes):
+            await sgl_update_weights(
+                engine=self.rollout_engine,
+                params_batch=params_batch,
+                device_mesh_key="fsdp",
+                device_mesh=self.device_mesh,
+            )
+
     def _generate_sequences_with_rollout_engine(self, prompts: TensorDict) -> TensorDict:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._update_rollout_engine())
+
         if not self.is_rollout_engine_up:
             from sglang.utils import wait_for_server
+
             wait_for_server(self.rollout_url)
             self.is_rollout_engine_up = True
 
@@ -931,7 +969,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         outputs_tensor = torch.full((len(outputs), response_length), 3, device=device_name)
         for i, output in enumerate(outputs):
             output_ids = output["token_ids"]
-            outputs_tensor[i, :len(output_ids)] = output_ids
+            outputs_tensor[i, : len(output_ids)] = output_ids
 
         return TensorDict(
             {
