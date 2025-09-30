@@ -492,10 +492,13 @@ class FSDPEngine(BaseEngine):
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
 
+        model_config = self.model_config
+        model_config.local_path = "swiss-ai/Apertus-8B-Instruct-2509"
+
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {rollout_config.name} rollout", logger=logger)
         rollout_engine = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=self.model_config, device_mesh=rollout_device_mesh
+            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
         )
         log_gpu_memory_usage(f"After building {rollout_config.name} rollout", logger=logger)
 

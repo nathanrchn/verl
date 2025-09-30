@@ -132,7 +132,6 @@ class SFTTrainer:
 
         # Add rollout configuration if enabled
         if self.use_rollout and self.rollout_config is not None:
-            engine_args["use_rollout_engine"] = True
             engine_args["rollout_config"] = self.rollout_config
 
             if self.rank == 0:

@@ -20,19 +20,19 @@ WORK_DIR="/users/$(id -un)/projects/verl"
 
 # Paths
 SAVE_FOLDER="/iopsstor/scratch/cscs/$(id -un)/apertus-sft-runs"
-DATASET_PATH="/iopsstor/scratch/cscs/nathanrchn/debug-apertus-sft-mixture-8e-with-eval"
+DATASET_PATH="/iopsstor/scratch/cscs/nathanrchn/debug-apertus-sft-mixture-8e-with-eval-full"
 
 # Model configuration
 MODEL_PATH="swiss-ai/Apertus-8B-2509"
 MODEL_REVISION="main"
 TOKENIZER_PATH="swiss-ai/Apertus-8B-Instruct-2509"
-MODEL_DTYPE="bf16"
+MODEL_DTYPE="bfloat16"
 
 # Data configuration
 MICRO_BATCH_SIZE_PER_GPU=16
 MAX_LENGTH=4096
 TRAIN_BATCH_SIZE=512
-VAL_BATCH_SIZE=256
+VAL_BATCH_SIZE=1024
 ROLLOUT_BATCH_SIZE=256
 ROLLOUT_MAX_LENGTH=512
 TRAIN_FILE="train.parquet"
@@ -48,6 +48,7 @@ LR_WARMUP_STEPS_RATIO=0.03
 TOTAL_EPOCHS=1
 TEST_FREQ=128
 TOTAL_TRAINING_STEPS=null
+WEIGHT_DECAY=0.0
 
 # Experiment configuration
 PROJECT_NAME="apertus-sft-bs-issue"
@@ -59,6 +60,9 @@ TOOLS_KEY="tools"
 ENABLE_THINKING_KEY="enable_thinking"
 CUSTOM_CLS_PATH="verl/utils/dataset/multiturn_sft_dataset.py"
 CUSTOM_CLS_NAME="ApertusSFTDataset"
+
+# Rollout
+USE_ROLLOUT=true
 
 # Logging
 LOGGER='["console","wandb"]'
@@ -90,6 +94,8 @@ export NO_PROXY="0.0.0.0,$NO_PROXY"
 export NCCL_NET="ofi"
 export NCCL_DEBUG=INFO
 export HYDRA_FULL_ERROR=1
+export SGLANG_HOST_IP=$head_node
+export SGLANG_PORT=60000
 
 pip install --upgrade pip setuptools wheel --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
 pip install git+https://github.com/huggingface/transformers.git --no-deps --retries 3 --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
@@ -98,7 +104,7 @@ cd $WORK_DIR
 
 pip install -e . --no-cache-dir
 
-torchrun --nnodes=${SLURM_NNODES} --nproc_per_node=4 --node_rank=${local_rank} --master_addr=${head_node} --master_port=${MASTER_PORT} \
+torchrun --nnodes=$SLURM_NNODES --nproc_per_node=4 --node_rank=$local_rank --master_addr=$head_node --master_port=$MASTER_PORT \
     -m verl.trainer.sft_trainer \
     data.train_files=$dataset_path/$TRAIN_FILE \
     data.val_files=$dataset_path/$VAL_FILE \
@@ -123,9 +129,12 @@ torchrun --nnodes=${SLURM_NNODES} --nproc_per_node=4 --node_rank=${local_rank} -
     model.tokenizer_path=$TOKENIZER_PATH \
     model.use_remove_padding=true \
     engine.model_dtype=$MODEL_DTYPE \
+    engine.strategy=fsdp \
     optim.lr=$LEARNING_RATE \
     optim.warmup_style=$WARMUP_STYLE \
+    optim.weight_decay=$WEIGHT_DECAY \
     optim.lr_warmup_steps_ratio=$LR_WARMUP_STEPS_RATIO \
+    use_rollout=$USE_ROLLOUT \
     checkpoint.save_contents='["model","optimizer","extra","hf_model"]' \
     trainer.default_local_dir=$save_path \
     trainer.project_name=$PROJECT_NAME \
