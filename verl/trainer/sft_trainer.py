@@ -270,23 +270,24 @@ class SFTTrainer:
             )
 
         if self.rollout_dataloader is not None:
-            rollout_outputs = []
+            rollout_texts = []
+            rollout_lengths = []
+            rollout_output_ids = []
             for rollout_data in tqdm(self.rollout_dataloader, desc="rollout", disable=not is_logging):
                 rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
                 output = self.engine.generate_sequences(prompts=rollout_data)
                 if self.engine.is_mp_src_rank_with_outputs():
-                    rollout_outputs.extend(output)
+                    rollout_texts.extend(output["texts"] or [])
+                    rollout_lengths.extend(output["lengths"])
+                    rollout_output_ids.extend(output["output_ids"])
 
             if self.engine.is_mp_src_rank_with_outputs():
-                rollout_texts = [ro["texts"] for ro in rollout_outputs if ro["texts"] is not None]
-                rollout_lengths = [ro["lengths"] for ro in rollout_outputs]
-                rollout_output_ids = [ro["output_ids"] for ro in rollout_outputs]
                 print(rollout_texts[:2])
                 # compute ttr
                 token_ttr = torch.tensor(compute_token_ttr(rollout_output_ids), device=self.device_name)
                 token_3gram_ttr = torch.tensor(compute_token_ttr(rollout_output_ids, 3), device=self.device_name)
                 text_ttr = torch.tensor(compute_text_ttr(rollout_texts), device=self.device_name)
-                rollout_length = torch.mean(torch.tensor(rollout_lengths, device=self.device_name))
+                rollout_length = torch.mean(torch.tensor(rollout_lengths, dtype=torch.float32, device=self.device_name))
                 # average over data parallel group
                 torch.distributed.all_reduce(
                     token_ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()

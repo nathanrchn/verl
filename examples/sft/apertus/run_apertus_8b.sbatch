@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --account=a-infra01
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=04:00:00
+#SBATCH --time=01:30:00
 #SBATCH --exclusive
 #SBATCH --nodes=9
 #SBATCH --partition=normal
@@ -51,7 +51,7 @@ TOTAL_TRAINING_STEPS=null
 WEIGHT_DECAY=0.0
 
 # Experiment configuration
-PROJECT_NAME="apertus-sft-bs-issue"
+PROJECT_NAME="apertus-sft"
 
 # Multi-turn configuration
 ENABLE_MULTITURN=true
@@ -135,8 +135,6 @@ torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --m
     +model.revision=$MODEL_REVISION \
     model.tokenizer_path=$TOKENIZER_PATH \
     model.use_remove_padding=true \
-    model.use_fused_kernels=true \
-    model.fused_kernel_options.impl_backend=triton \
     engine.model_dtype=$MODEL_DTYPE \
     engine.strategy=fsdp \
     optim.lr=$LEARNING_RATE \
