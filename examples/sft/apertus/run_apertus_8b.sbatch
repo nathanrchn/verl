@@ -6,9 +6,9 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
-#SBATCH --nodes=8
+#SBATCH --nodes=9
 #SBATCH --partition=normal
-#SBATCH --environment=nccl
+#SBATCH --environment=verl_swiss
 #SBATCH --output=logs/%j/log.out
 #SBATCH --error=logs/%j/log.err
 
@@ -74,6 +74,7 @@ RUN_NAME="${MODEL_NAME}-${MODEL_REVISION}-lr${LEARNING_RATE}-bs${TRAIN_BATCH_SIZ
 
 nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 head_node=${nodes[0]}
+head_node_ip=$(srun --nodes=1 --ntasks=1 --nodelist=$head_node hostname -i)
 
 current_datetime=$(date '+%Y-%m-%d_%H-%M-%S')
 save_path="$SAVE_FOLDER/$RUN_NAME/$current_datetime"
@@ -84,8 +85,9 @@ cp "$0" "$save_path/run_apertus_8b.sbatch"
 
 if [ "$USE_ROLLOUT" = true ]; then
     rollout_node=${nodes[-1]}
+    rollout_node_ip=$(srun --nodes=1 --ntasks=1 --nodelist=$rollout_node hostname -i)
     TRAINING_NODES=$((SLURM_NNODES - 1))
-    ROLLOUT_URL="http://${rollout_node}:60001"
+    ROLLOUT_URL="http://${rollout_node_ip}:30000"
 else
     TRAINING_NODES=$SLURM_NNODES
     ROLLOUT_URL=null
@@ -102,18 +104,14 @@ set -x
 export no_proxy="0.0.0.0,$no_proxy"
 export NO_PROXY="0.0.0.0,$NO_PROXY"
 
-export NCCL_NET="ofi"
 export NCCL_DEBUG=INFO
 export HYDRA_FULL_ERROR=1
 
-pip install --upgrade pip setuptools wheel --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
-pip install git+https://github.com/huggingface/transformers.git --no-deps --retries 3 --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
-
 cd $WORK_DIR
 
-pip install -e . --no-cache-dir
+pip install -e . --no-cache-dir --no-deps
 
-torchrun --nnodes=$SLURM_NNODES --nproc_per_node=4 --node_rank=$local_rank --master_addr=$head_node --master_port=$MASTER_PORT \
+torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --master_addr=$head_node --master_port=$MASTER_PORT \
     -m verl.trainer.sft_trainer \
     data.train_files=$dataset_path/$TRAIN_FILE \
     data.val_files=$dataset_path/$VAL_FILE \
@@ -137,6 +135,8 @@ torchrun --nnodes=$SLURM_NNODES --nproc_per_node=4 --node_rank=$local_rank --mas
     +model.revision=$MODEL_REVISION \
     model.tokenizer_path=$TOKENIZER_PATH \
     model.use_remove_padding=true \
+    model.use_fused_kernels=true \
+    model.fused_kernel_options.impl_backend=triton \
     engine.model_dtype=$MODEL_DTYPE \
     engine.strategy=fsdp \
     optim.lr=$LEARNING_RATE \
@@ -162,11 +162,10 @@ set -x
 export no_proxy="0.0.0.0,$no_proxy"
 export NO_PROXY="0.0.0.0,$NO_PROXY"
 
-export NCCL_NET="ofi"
 export NCCL_DEBUG=INFO
 
-python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --host=0.0.0.0 --port=60001 --decode-log-interval 1 --skip-server-warmup --random-seed 42
-"
+python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --host=0.0.0.0 --port=30000 --decode-log-interval 1 --skip-server-warmup --random-seed 42
+" &
 fi
 
 wait

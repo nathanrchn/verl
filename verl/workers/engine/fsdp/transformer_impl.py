@@ -18,19 +18,21 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
-import asyncio
+import time
 import warnings
 from urllib.parse import urlparse
 from contextlib import nullcontext
 from typing import Callable, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
+from sglang.utils import wait_for_server
+from sglang.srt.utils import init_custom_process_group
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 
 try:
     # for torch 2.5+
@@ -151,14 +153,17 @@ class FSDPEngine(BaseEngine):
             else entropy_from_logits
         )
 
+        self.weight_update_group = None
+        self.weight_update_store = None
+
         if self.use_rollout_engine:
-            parsed_url = urlparse(self.rollout_url)
+            self.rollout_parsed_url = urlparse(self.rollout_url)
             self.rollout_engine = HttpServerAdapter(
-                host=parsed_url.hostname,
-                port=parsed_url.port,
+                host=self.rollout_parsed_url.hostname,
+                port=self.rollout_parsed_url.port,
                 launch_server=False,
+                model_path="swiss-ai/Apertus-8B-Instruct-2509",
             )
-            self.is_rollout_engine_up = False
 
     def is_mp_src_rank_with_outputs(self):
         if self.ulysses_device_mesh is not None:
@@ -191,6 +196,12 @@ class FSDPEngine(BaseEngine):
             processing_class=self.model_config.get_processor(),
             checkpoint_config=self.checkpoint_config,
         )
+
+        if self.use_rollout_engine and self.rank == 0:
+            wait_for_server(self.rollout_url)
+            self._init_weight_update_group()
+
+        torch.distributed.barrier()
 
     def _init_device_mesh(self):
         world_size = torch.distributed.get_world_size()
@@ -252,12 +263,12 @@ class FSDPEngine(BaseEngine):
                 fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
             )
 
-            use_fused_kernels = self.model_config.use_fused_kernels
+            self.use_fused_kernels = self.model_config.use_fused_kernels
             apply_monkey_patch(
                 model=module,
                 use_remove_padding=self.use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
-                use_fused_kernels=use_fused_kernels,
+                use_fused_kernels=self.use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
             )
 
@@ -461,6 +472,41 @@ class FSDPEngine(BaseEngine):
         self.module = module
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
+
+    def _init_weight_update_group(self):
+        master_address = os.environ.get("MASTER_ADDR")
+        master_port = int(os.environ.get("MASTER_PORT")) + 1
+
+        future = ThreadPoolExecutor().submit(
+            self.rollout_engine._make_request,
+            endpoint="init_weights_update_group",
+            payload={
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": 1,
+                "world_size": 2,
+                "group_name": "weight_update_group",
+                "backend": "nccl",
+            },
+        )
+
+        self.weight_update_store = torch.distributed.TCPStore(
+            host_name=master_address,
+            port=master_port,
+            world_size=2,
+            is_master=True,
+            timeout=torch.distributed.default_pg_timeout,
+        )
+
+        self.weight_update_group = init_custom_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=2,
+            rank=0,
+            group_name="weight_update_group",
+        )
+
+        future.result()
 
     def train_mode(self):
         """
@@ -678,8 +724,6 @@ class EngineTrainModeCtx:
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"])
 class FSDPEngineWithLMHead(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
-        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
-        use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         temperature = micro_batch["temperature"]
 
         multi_modal_inputs = {}
@@ -697,7 +741,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # args used to get outputs
         output_args = {}
 
-        if use_remove_padding:
+        if self.use_remove_padding:
             input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
                 input_ids.unsqueeze(-1), attention_mask
             )  # input_ids_rmpad (total_nnz, ...)
@@ -770,7 +814,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             }
 
         extra_args = {}
-        if use_fused_kernels:
+        if self.use_fused_kernels:
             extra_args["temperature"] = temperature
             extra_args["return_dict"] = True
 
@@ -780,8 +824,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_inputs, output_args
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
-        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
-        use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         temperature = micro_batch["temperature"]
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
 
@@ -790,11 +832,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         response_length = micro_batch["responses"].size(-1)
 
-        if use_remove_padding:
+        if self.use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
             indices = output_args["indices"]
 
-            if use_fused_kernels:
+            if self.use_fused_kernels:
                 log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                 entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
             else:
@@ -859,7 +901,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
         else:  # not using rmpad and no ulysses sp
-            if use_fused_kernels:
+            if self.use_fused_kernels:
                 log_probs = output.log_probs[:, -response_length - 1 : -1]
                 entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
@@ -891,6 +933,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
+                return_dict=self.use_fused_kernels,
             )  # prevent model thinks we are generating
 
             model_output = self.prepare_model_outputs(
@@ -920,39 +963,51 @@ class FSDPEngineWithLMHead(FSDPEngine):
         else:
             return self._generate_sequences_with_fsdp_engine(prompts)
 
-    async def _update_rollout_engine(self):
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.module)
-
+    def _update_rollout_engine(self):
         params = self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.module)
-
-        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
         per_tensor_param = (
-            (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-            for name, param in params.items()
+            (name, param.full_tensor() if isinstance(param, DTensor) else param) for name, param in params.items()
         )
 
-        update_weights_bucket_bytes = int(512) << 20
-        for params_batch in get_named_tensor_buckets(per_tensor_param, update_weights_bucket_bytes):
-            await sgl_update_weights(
-                engine=self.rollout_engine,
-                params_batch=params_batch,
-                device_mesh_key="fsdp",
-                device_mesh=self.device_mesh,
-            )
+        if self.rank == 0:
+            start_time = time.time()
+
+            bucket_bytes = int(512) << 20
+            for params_batch in get_named_tensor_buckets(per_tensor_param, bucket_bytes):
+                names, dtypes, shapes = [], [], []
+                for name, param in params_batch:
+                    names.append(name)
+                    dtypes.append(str(param.dtype).split(".")[-1])
+                    shapes.append(list(param.shape))
+
+                future = ThreadPoolExecutor().submit(
+                    self.rollout_engine._make_request,
+                    endpoint="update_weights_from_distributed",
+                    payload={
+                        "names": names,
+                        "dtypes": dtypes,
+                        "shapes": shapes,
+                    },
+                )
+
+                handles = []
+                for name, param in params_batch:
+                    handles.append(
+                        torch.distributed.broadcast(param, src=0, group=self.weight_update_group, async_op=True)
+                    )
+
+                for handle in handles:
+                    handle.wait()
+
+                future.result()
+
+            print(f"update_rollout_engine time: {time.time() - start_time}")
+
+        torch.distributed.barrier()
 
     def _generate_sequences_with_rollout_engine(self, prompts: TensorDict) -> TensorDict:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._update_rollout_engine())
-
-        if not self.is_rollout_engine_up:
-            from sglang.utils import wait_for_server
-
-            wait_for_server(self.rollout_url)
-            self.is_rollout_engine_up = True
+        self._update_rollout_engine()
 
         device_name = get_device_name()
         response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
@@ -962,14 +1017,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         outputs = self.rollout_engine.generate(
             input_ids=unpadded_input_ids,
-            sampling_params={"max_new_tokens": response_length},
+            sampling_params={"max_new_tokens": response_length, "temperature": 0.0, "top_k": 1},
         )
-        print(outputs)
 
         outputs_tensor = torch.full((len(outputs), response_length), 3, device=device_name)
         for i, output in enumerate(outputs):
-            output_ids = output["token_ids"]
-            outputs_tensor[i, : len(output_ids)] = output_ids
+            output_ids = output["output_ids"]
+            max_len = min(len(output_ids), response_length)
+            outputs_tensor[i, :max_len] = torch.tensor(output_ids[:max_len], device=device_name)
 
         return TensorDict(
             {
@@ -994,7 +1049,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=response_length,
-                eos_token_id=[68, 71],  # TODO: fix this
+                eos_token_id=[2, 68, 71],  # TODO: fix this
                 pad_token_id=3,  # TODO: fix this
                 do_sample=False,
                 use_cache=True,
@@ -1022,10 +1077,9 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
     """
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
-        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         response_length = micro_batch["responses"].size(-1)
 
-        if use_remove_padding:
+        if self.use_remove_padding:
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
 
