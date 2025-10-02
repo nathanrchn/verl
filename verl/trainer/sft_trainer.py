@@ -38,7 +38,7 @@ from verl.utils.distributed import destroy_global_process_group
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.logger import log_with_rank
 from verl.utils.tracking import Tracking
-from verl.utils.metric.utils import compute_ttr
+from verl.utils.metric.utils import compute_token_ttr, compute_text_ttr
 
 if is_cuda_available:
     pass
@@ -270,20 +270,35 @@ class SFTTrainer:
             )
 
         if self.rollout_dataloader is not None:
-            rollout_responses = []
+            rollout_outputs = []
             for rollout_data in tqdm(self.rollout_dataloader, desc="rollout", disable=not is_logging):
                 rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
                 output = self.engine.generate_sequences(prompts=rollout_data)
                 if self.engine.is_mp_src_rank_with_outputs():
-                    rollout_responses.extend(output["responses"].tolist())
+                    rollout_outputs.extend(output)
 
             if self.engine.is_mp_src_rank_with_outputs():
-                print(rollout_responses[:2])
+                rollout_texts = [ro["texts"] for ro in rollout_outputs if ro["texts"] is not None]
+                rollout_lengths = [ro["lengths"] for ro in rollout_outputs]
+                rollout_output_ids = [ro["output_ids"] for ro in rollout_outputs]
+                print(rollout_texts[:2])
                 # compute ttr
-                ttr = torch.tensor(compute_ttr(rollout_responses), device=self.device_name)
+                token_ttr = torch.tensor(compute_token_ttr(rollout_output_ids), device=self.device_name)
+                token_3gram_ttr = torch.tensor(compute_token_ttr(rollout_output_ids, 3), device=self.device_name)
+                text_ttr = torch.tensor(compute_text_ttr(rollout_texts), device=self.device_name)
+                rollout_length = torch.mean(torch.tensor(rollout_lengths, device=self.device_name))
                 # average over data parallel group
                 torch.distributed.all_reduce(
-                    ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                    token_ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                )
+                torch.distributed.all_reduce(
+                    token_3gram_ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                )
+                torch.distributed.all_reduce(
+                    text_ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                )
+                torch.distributed.all_reduce(
+                    rollout_length, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
                 )
 
         if is_logging:
@@ -292,7 +307,10 @@ class SFTTrainer:
                 "val/entropy": val_entropy.detach().item(),
             }
             if self.rollout_dataloader is not None:
-                metric["val/ttr"] = ttr.detach().item()
+                metric["val/token_ttr"] = token_ttr.detach().item()
+                metric["val/token_3gram_ttr"] = token_3gram_ttr.detach().item()
+                metric["val/text_ttr"] = text_ttr.detach().item()
+                metric["val/rollout_length"] = rollout_length.detach().item()
             tracking.log(data=metric, step=global_step)
             last_valid_metric = metric
         torch.distributed.barrier()

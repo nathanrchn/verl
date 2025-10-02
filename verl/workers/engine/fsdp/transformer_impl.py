@@ -933,7 +933,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
-                return_dict=self.use_fused_kernels,
             )  # prevent model thinks we are generating
 
             model_output = self.prepare_model_outputs(
@@ -957,7 +956,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
             return loss, output
 
-    def generate_sequences(self, prompts: TensorDict) -> TensorDict:
+    def generate_sequences(self, prompts: TensorDict) -> dict[str, any]:
         if self.use_rollout_engine:
             return self._generate_sequences_with_rollout_engine(prompts)
         else:
@@ -1006,46 +1005,46 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         torch.distributed.barrier()
 
-    def _generate_sequences_with_rollout_engine(self, prompts: TensorDict) -> TensorDict:
+    def _generate_sequences_with_rollout_engine(self, prompts: TensorDict) -> dict[str, any]:
         self._update_rollout_engine()
 
-        device_name = get_device_name()
         response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
 
-        input_ids = prompts["input_ids"].tolist()
-        unpadded_input_ids = [[id for id in ids if id != 3] for ids in input_ids]
+        unpadded_input_ids = [ids[ids != 3].tolist() for ids in prompts["input_ids"]]
 
         outputs = self.rollout_engine.generate(
             input_ids=unpadded_input_ids,
-            sampling_params={"max_new_tokens": response_length, "temperature": 0.0, "top_k": 1},
+            sampling_params={"max_new_tokens": response_length, "temperature": 0.0},
         )
 
-        outputs_tensor = torch.full((len(outputs), response_length), 3, device=device_name)
-        for i, output in enumerate(outputs):
+        ids = []
+        texts = []
+        lengths = []
+        for output in outputs:
             output_ids = output["output_ids"]
-            max_len = min(len(output_ids), response_length)
-            outputs_tensor[i, :max_len] = torch.tensor(output_ids[:max_len], device=device_name)
+            ids.append(output_ids)
+            texts.append(output["text"])
+            lengths.append(len(output_ids))
 
-        return TensorDict(
-            {
-                "input_ids": prompts["input_ids"],
-                "responses": outputs_tensor,
-            },
-            batch_size=len(outputs),
-        )
+        return {
+            "input_ids": unpadded_input_ids,
+            "output_ids": ids,
+            "texts": texts,
+            "lengths": lengths,
+        }
 
-    def _generate_sequences_with_fsdp_engine(self, prompts: TensorDict) -> TensorDict:
+    def _generate_sequences_with_fsdp_engine(self, prompts: TensorDict) -> dict[str, any]:
         device_name = get_device_name()
         response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
 
         input_ids = prompts["input_ids"].to(device_name)
         attention_mask = prompts["attention_mask"].to(device_name)
-        batch_size, prompt_length = input_ids.shape
+        _, prompt_length = input_ids.shape
 
         self.module.eval()
 
         with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            generated_sequences = self.module.generate(
+            sequences = self.module.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=response_length,
@@ -1054,20 +1053,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 do_sample=False,
                 use_cache=True,
                 return_dict_in_generate=True,
-                output_scores=True,
-            )
+            ).sequences
 
-        sequences = generated_sequences.sequences
         prompt_ids = sequences[:, :prompt_length]
-        response_ids = sequences[:, prompt_length:]
+        output_ids = sequences[:, prompt_length:]
 
-        return TensorDict(
-            {
-                "input_ids": prompt_ids,
-                "responses": response_ids,
-            },
-            batch_size=batch_size,
-        )
+        unpadded_input_ids = [ids[ids != 3].tolist() for ids in prompt_ids]
+        unpadded_output_ids = [ids[ids != 3].tolist() for ids in output_ids]
+
+        return {
+            "ids": unpadded_input_ids,
+            "output_ids": unpadded_output_ids,
+            "texts": None,
+            "lengths": response_length,
+        }
 
 
 @EngineRegistry.register(model_type="value_model", backend=["fsdp", "fsdp2"])

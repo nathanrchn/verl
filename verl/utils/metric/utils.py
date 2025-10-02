@@ -54,26 +54,51 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     return metrics
 
 
-def compute_ttr(responses: list[list[int]]) -> float:
-    """
-    Compute the 3-gram uniqueness ratio of a list of responses.
-    """
-    if len(responses) == 0:
+def compute_token_ttr(outputs: list[list[int]], n: int = 1) -> float:
+    if len(outputs) == 0:
         return 0.0
 
-    output = 0.0
-    for response in responses:
-        response_without_padding = [token for token in response if token != 3]
-        if len(response_without_padding) < 3:
+    ttr_sum = 0.0
+    valid_count = 0
+
+    for sequence in outputs:
+        if len(sequence) < n:
             continue
 
-        trigrams = []
-        for i in range(len(response_without_padding) - 2):
-            trigram = tuple(response_without_padding[i : i + 3])
-            trigrams.append(trigram)
+        ngrams = []
+        for i in range(len(sequence) - n + 1):
+            ngram = tuple(sequence[i : i + n])
+            ngrams.append(ngram)
 
-        if len(trigrams) > 0:
-            output += len(set(trigrams)) / len(trigrams)
+        if len(ngrams) > 0:
+            ttr = len(set(ngrams)) / len(ngrams)
+            ttr_sum += ttr
+            valid_count += 1
 
-    valid_responses = sum(1 for response in responses if len([token for token in response if token != 3]) >= 3)
-    return output / valid_responses if valid_responses > 0 else 0.0
+    return ttr_sum / valid_count if valid_count > 0 else 0.0
+
+
+def compute_text_ttr(texts: list[str], n: int = 1) -> float:
+    if len(texts) == 0:
+        return 0.0
+
+    ttr_sum = 0.0
+    valid_count = 0
+
+    for text in texts:
+        words = text.split()
+
+        if len(words) < n:
+            continue
+
+        ngrams = []
+        for i in range(len(words) - n + 1):
+            ngram = tuple(words[i : i + n])
+            ngrams.append(ngram)
+
+        if len(ngrams) > 0:
+            ttr = len(set(ngrams)) / len(ngrams)
+            ttr_sum += ttr
+            valid_count += 1
+
+    return ttr_sum / valid_count if valid_count > 0 else 0.0
