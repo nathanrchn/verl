@@ -386,7 +386,7 @@ class SFTTrainer:
                     metrics = {}
                     metrics["train/loss"] = loss.item()
                     metrics["train/grad_norm"] = output_metrics["grad_norm"]
-                    metrics["train/lr"] = lr
+                    metrics["train/lr"] = lr.item()
                     metrics["train/global_tokens"] = total_tokens.item()
                     metrics["train/cumulative_tokens"] = self.cumulative_tokens
                     # mfu

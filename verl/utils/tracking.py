@@ -186,7 +186,6 @@ class Tracking:
                         for step, data in list_data:
                             logger_instance.log(data=data, step=step)
                         self.wandb_cache = []
-
                 else:
                     logger_instance.log(data=data, step=step)
 
@@ -511,6 +510,7 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
 
 def _sync_offline_wandb(wandb, default_local_dir):
     wandb_dir = os.path.join(default_local_dir, "wandb")
