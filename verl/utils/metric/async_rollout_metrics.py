@@ -5,6 +5,7 @@ from typing import Any, Iterator
 import torch
 import torch.distributed
 from requests import post
+from sglang.utils import wait_for_server
 from sglang.srt.utils import init_custom_process_group
 from torch.utils.data import DataLoader
 
@@ -54,6 +55,8 @@ class AsyncRolloutMetrics:
         )
 
     def _init_weight_update_group(self):
+        wait_for_server(self.rollout_url)
+
         future = ThreadPoolExecutor().submit(
             post,
             url=f"{self.rollout_url}/init_weights_update_group",
