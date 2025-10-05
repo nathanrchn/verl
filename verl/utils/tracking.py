@@ -168,7 +168,10 @@ class Tracking:
                     # Allow past steps to be logged
                     for metric in data:
                         if metric not in self.wandb_metrics:
-                            self.
+                            wandb.define_metric(metric, step_metric="step")
+                            self.wandb_metrics.add(metric)
+
+                    logger_instance.log(data={**data, "step": step})
                 else:
                     logger_instance.log(data=data, step=step)
 
