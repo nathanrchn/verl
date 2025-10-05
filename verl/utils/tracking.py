@@ -81,6 +81,7 @@ class Tracking:
                 mode="offline",
             )
             self.logger["wandb"] = wandb
+            self.wandb_metrics = set()
 
         if "trackio" in default_backend:
             import trackio
@@ -163,7 +164,13 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                if default_backend == "wandb":
+                    # Allow past steps to be logged
+                    for metric in data:
+                        if metric not in self.wandb_metrics:
+                            self.
+                else:
+                    logger_instance.log(data=data, step=step)
 
         if "wandb" in self.logger and time.time() - self.last_sync_time > SYNC_INTERVAL:
             wandb_dir = os.path.join(self.default_local_dir, "wandb")
