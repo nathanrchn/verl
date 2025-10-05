@@ -477,7 +477,7 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
 
     def __getitem__(self, item):
         tokenizer = self.tokenizer
-        messages = self.messages[item]
+        messages = loads(self.messages[item]) if self.messages is not None and self.messages[item] != "" else None
         tools = loads(self.tools[item]) if self.tools is not None and self.tools[item] != "" else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
         rollout_params = (
