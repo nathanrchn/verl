@@ -66,7 +66,7 @@ def compute_token_ttr(sequence: list[int], n: int = 1) -> float:
     if len(ngrams) > 0:
         ttr = len(set(ngrams)) / len(ngrams)
         return ttr
-    
+
     return 0.0
 
 
@@ -84,5 +84,5 @@ def compute_text_ttr(text: str, n: int = 1) -> float:
     if len(ngrams) > 0:
         ttr = len(set(ngrams)) / len(ngrams)
         return ttr
-    
+
     return 0.0

@@ -165,6 +165,8 @@ class Tracking:
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 if default_backend == "wandb":
+                    import wandb
+
                     # Allow past steps to be logged
                     for metric in data:
                         if metric not in self.wandb_metrics:
