@@ -69,6 +69,7 @@ class MultiTurnSFTDataset(Dataset):
         self.messages_key = multiturn_config.get("messages_key", "messages")
         self.tools_key = multiturn_config.get("tools_key", "tools")
         self.enable_thinking_key = multiturn_config.get("enable_thinking_key", "enable_thinking")
+        self.rollout_params_key = multiturn_config.get("rollout_params_key", "rollout_params")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
         assert self.truncation in ["error", "left", "right"]
         # for rollout
@@ -117,11 +118,18 @@ class MultiTurnSFTDataset(Dataset):
             self.tools = self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive).tolist()
         else:
             self.tools = None
+
         # Extract enable_thinking list from dataframe
         if self.enable_thinking_key in self.dataframe.columns:
             self.enable_thinking = self.dataframe[self.enable_thinking_key].tolist()
         else:
             self.enable_thinking = None
+
+        # Extract rollout_params list from dataframe
+        if self.rollout_params_key in self.dataframe.columns:
+            self.rollout_params = self.dataframe[self.rollout_params_key].tolist()
+        else:
+            self.rollout_params = None
 
     def __len__(self):
         return len(self.messages)
@@ -472,6 +480,11 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
         messages = self.messages[item]
         tools = loads(self.tools[item]) if self.tools is not None and self.tools[item] != "" else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
+        rollout_params = (
+            loads(self.rollout_params[item])
+            if self.rollout_params is not None and self.rollout_params[item] != ""
+            else {}
+        )
 
         output = tokenizer.apply_chat_template(
             messages,
@@ -543,4 +556,5 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
             "position_ids": compute_position_id_with_mask(attention_mask_tensor),
             "responses": torch.from_numpy(input_ids[1:]),
             "response_mask": torch.from_numpy(mask[1:].astype(np.int32)),
+            "rollout_params": rollout_params,
         }

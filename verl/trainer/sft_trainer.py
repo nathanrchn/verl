@@ -16,6 +16,8 @@
 import os
 from functools import partial
 
+from verl.utils.metric.async_rollout_metrics import AsyncRolloutMetrics
+
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -38,7 +40,8 @@ from verl.utils.distributed import destroy_global_process_group
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.logger import log_with_rank
 from verl.utils.tracking import Tracking
-from verl.utils.metric.utils import compute_token_ttr, compute_text_ttr
+from verl.utils.dataset.rl_dataset import collate_fn
+from verl.utils.metric.rollout_metrics import RolloutMetrics
 
 if is_cuda_available:
     pass
@@ -82,6 +85,8 @@ class SFTTrainer:
         self.loss_fn = partial(sft_loss, config=None)
 
         self.flops_counter = FlopsCounter(self.model_config.hf_config)
+
+        self._build_rollout_metrics()
 
         if self.rank == 0:
             print(self.config)
@@ -162,11 +167,14 @@ class SFTTrainer:
         val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
         if hasattr(config.data, "rollout_files") and config.data.rollout_files is not None:
-            if hasattr(config.data, "rollout_max_size") and config.data.rollout_max_size is not None:
-                config.data.max_length = config.data.rollout_max_size
+            if self.rank == 0:
+                if hasattr(config.data, "rollout_max_size") and config.data.rollout_max_size is not None:
+                    config.data.max_length = config.data.rollout_max_size
 
-            config.data.add_generation_prompt = True
-            rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
+                config.data.add_generation_prompt = True
+                rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
+            else:
+                rollout_dataset = True
         else:
             rollout_dataset = None
 
@@ -195,6 +203,7 @@ class SFTTrainer:
             dataset=self.train_dataset,
             batch_size=self.train_batch_size_per_dp,
             sampler=self.train_sampler,
+            collate_fn=collate_fn,
             num_workers=8,
             pin_memory=True,
             drop_last=True,
@@ -210,29 +219,25 @@ class SFTTrainer:
             dataset=self.val_dataset,
             batch_size=val_batch_size_per_dp,
             sampler=self.val_sampler,
+            collate_fn=collate_fn,
             num_workers=8,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
         )
 
-        if self.rollout_dataset is not None:
-            rollout_batch_size_per_dp = (config.data.rollout_batch_size or self.global_batch_size) // dp_size
-
-            self.rollout_sampler = DistributedSampler(
-                self.rollout_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
-            )
-            self.rollout_dataloader = StatefulDataLoader(
-                dataset=self.rollout_dataset,
-                batch_size=rollout_batch_size_per_dp,
-                sampler=self.rollout_sampler,
-                num_workers=8,
-                pin_memory=True,
-                drop_last=True,
-                pin_memory_device=device_name,
+    def _build_rollout_metrics(self):
+        if self.rank == 0 and self.rollout_dataset is not None:
+            self.rollout_metrics = AsyncRolloutMetrics(
+                rollout_dataset=self.rollout_dataset,
+                rollout_url=self.rollout_url,
+                master_address=os.environ["MASTER_ADDR"],
+                master_port=int(os.environ["MASTER_PORT"]) + 1,
+                rollout_batch_size=self.config.data.rollout_batch_size,
+                pad_token_id=3,  # TODO: fix this
             )
         else:
-            self.rollout_dataloader = None
+            self.rollout_metrics = None
 
     def _validate_rollout(self, is_logging, global_step, tracking, meta_info):
         last_valid_metric = None
@@ -269,49 +274,22 @@ class SFTTrainer:
                 val_entropy, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
             )
 
-        if self.rollout_dataloader is not None:
-            rollout_texts = []
-            rollout_lengths = []
-            rollout_output_ids = []
-            for rollout_data in tqdm(self.rollout_dataloader, desc="rollout", disable=not is_logging):
-                rollout_data = tu.get_tensordict(tensor_dict=rollout_data, non_tensor_dict=meta_info)
-                output = self.engine.generate_sequences(prompts=rollout_data)
-                if self.engine.is_mp_src_rank_with_outputs():
-                    rollout_texts.extend(output["texts"] or [])
-                    rollout_lengths.extend(output["lengths"])
-                    rollout_output_ids.extend(output["output_ids"])
+        if self.rollout_dataset:
+            params = self.engine.get_state_dict_iter()
 
-            if self.engine.is_mp_src_rank_with_outputs():
-                print(rollout_texts[:2])
-                # compute ttr
-                token_ttr = torch.tensor(compute_token_ttr(rollout_output_ids), device=self.device_name)
-                token_3gram_ttr = torch.tensor(compute_token_ttr(rollout_output_ids, 3), device=self.device_name)
-                text_ttr = torch.tensor(compute_text_ttr(rollout_texts), device=self.device_name)
-                rollout_length = torch.mean(torch.tensor(rollout_lengths, dtype=torch.float32, device=self.device_name))
-                # average over data parallel group
-                torch.distributed.all_reduce(
-                    token_ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                )
-                torch.distributed.all_reduce(
-                    token_3gram_ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                )
-                torch.distributed.all_reduce(
-                    text_ttr, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                )
-                torch.distributed.all_reduce(
-                    rollout_length, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-                )
+            if self.rank == 0:
+                self.rollout_metrics.update_rollout_engine(params)
+
+        torch.distributed.barrier()
 
         if is_logging:
             metric = {
                 "val/loss": val_loss.detach().item(),
                 "val/entropy": val_entropy.detach().item(),
             }
-            if self.rollout_dataloader is not None:
-                metric["val/token_ttr"] = token_ttr.detach().item()
-                metric["val/token_3gram_ttr"] = token_3gram_ttr.detach().item()
-                metric["val/text_ttr"] = text_ttr.detach().item()
-                metric["val/rollout_length"] = rollout_length.detach().item()
+            if self.rollout_metrics is not None:
+                rollout_metrics, rollout_step = self.rollout_metrics.wait_compute_metrics()
+                tracking.log(data=rollout_metrics, step=rollout_step)
             tracking.log(data=metric, step=global_step)
             last_valid_metric = metric
         torch.distributed.barrier()
@@ -440,6 +418,10 @@ class SFTTrainer:
 
                 if is_last_step:
                     if is_logging:
+                        if self.rollout_metrics is not None:
+                            rollout_metrics, rollout_step = self.rollout_metrics.wait_compute_metrics()
+                            tracking.log(data=rollout_metrics, step=rollout_step)
+
                         print(f"Total time for train steps: {train_time:.2f}s")
                         print(f"Final validation metrics: {last_valid_metric}")
                     return

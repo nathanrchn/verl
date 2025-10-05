@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .rollout_metrics import EvalTaskRegistry, RolloutMetrics
 from .utils import reduce_metrics
 
-__all__ = ["reduce_metrics"]
+__all__ = ["reduce_metrics", "RolloutMetrics", "EvalTaskRegistry"]

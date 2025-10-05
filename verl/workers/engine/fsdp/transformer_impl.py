@@ -20,18 +20,14 @@ import logging
 import os
 import time
 import warnings
-from urllib.parse import urlparse
 from contextlib import nullcontext
-from typing import Callable, Optional
-from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Iterator, Optional
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
-from sglang.utils import wait_for_server
-from sglang.srt.utils import init_custom_process_group
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 try:
@@ -73,7 +69,6 @@ from verl.utils.fsdp_utils import (
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
-from verl.workers.rollout.sglang_rollout.http_server_engine import HttpServerAdapter
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
@@ -108,7 +103,6 @@ class FSDPEngine(BaseEngine):
         engine_config: FSDPEngineConfig,
         optimizer_config: FSDPOptimizerConfig,
         checkpoint_config: CheckpointConfig,
-        rollout_url: Optional[str] = None,
     ):
         """
         Initialize the FSDPEngine.
@@ -124,9 +118,6 @@ class FSDPEngine(BaseEngine):
         self.engine_config = engine_config
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
-
-        self.rollout_url = rollout_url
-        self.use_rollout_engine = self.rollout_url is not None
 
         self.mode = None
 
@@ -152,18 +143,6 @@ class FSDPEngine(BaseEngine):
             if self.engine_config.use_torch_compile  #  use torch compile by default
             else entropy_from_logits
         )
-
-        self.weight_update_group = None
-        self.weight_update_store = None
-
-        if self.use_rollout_engine:
-            self.rollout_parsed_url = urlparse(self.rollout_url)
-            self.rollout_engine = HttpServerAdapter(
-                host=self.rollout_parsed_url.hostname,
-                port=self.rollout_parsed_url.port,
-                launch_server=False,
-                model_path="swiss-ai/Apertus-8B-Instruct-2509",
-            )
 
     def is_mp_src_rank_with_outputs(self):
         if self.ulysses_device_mesh is not None:
@@ -196,10 +175,6 @@ class FSDPEngine(BaseEngine):
             processing_class=self.model_config.get_processor(),
             checkpoint_config=self.checkpoint_config,
         )
-
-        if self.use_rollout_engine and self.rank == 0:
-            wait_for_server(self.rollout_url)
-            self._init_weight_update_group()
 
         torch.distributed.barrier()
 
@@ -472,41 +447,6 @@ class FSDPEngine(BaseEngine):
         self.module = module
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
-
-    def _init_weight_update_group(self):
-        master_address = os.environ.get("MASTER_ADDR")
-        master_port = int(os.environ.get("MASTER_PORT")) + 1
-
-        future = ThreadPoolExecutor().submit(
-            self.rollout_engine._make_request,
-            endpoint="init_weights_update_group",
-            payload={
-                "master_address": master_address,
-                "master_port": master_port,
-                "rank_offset": 1,
-                "world_size": 2,
-                "group_name": "weight_update_group",
-                "backend": "nccl",
-            },
-        )
-
-        self.weight_update_store = torch.distributed.TCPStore(
-            host_name=master_address,
-            port=master_port,
-            world_size=2,
-            is_master=True,
-            timeout=torch.distributed.default_pg_timeout,
-        )
-
-        self.weight_update_group = init_custom_process_group(
-            backend="nccl",
-            init_method=f"tcp://{master_address}:{master_port}",
-            world_size=2,
-            rank=0,
-            group_name="weight_update_group",
-        )
-
-        future.result()
 
     def train_mode(self):
         """
@@ -957,83 +897,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
             return loss, output
 
     def generate_sequences(self, prompts: TensorDict) -> dict[str, any]:
-        if self.use_rollout_engine:
-            return self._generate_sequences_with_rollout_engine(prompts)
-        else:
-            return self._generate_sequences_with_fsdp_engine(prompts)
-
-    def _update_rollout_engine(self):
-        params = self.module.state_dict()
-        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
-        per_tensor_param = (
-            (name, param.full_tensor() if isinstance(param, DTensor) else param) for name, param in params.items()
-        )
-
-        if self.rank == 0:
-            start_time = time.time()
-
-            bucket_bytes = int(512) << 20
-            for params_batch in get_named_tensor_buckets(per_tensor_param, bucket_bytes):
-                names, dtypes, shapes = [], [], []
-                for name, param in params_batch:
-                    names.append(name)
-                    dtypes.append(str(param.dtype).split(".")[-1])
-                    shapes.append(list(param.shape))
-
-                future = ThreadPoolExecutor().submit(
-                    self.rollout_engine._make_request,
-                    endpoint="update_weights_from_distributed",
-                    payload={
-                        "names": names,
-                        "dtypes": dtypes,
-                        "shapes": shapes,
-                    },
-                )
-
-                handles = []
-                for name, param in params_batch:
-                    handles.append(
-                        torch.distributed.broadcast(param, src=0, group=self.weight_update_group, async_op=True)
-                    )
-
-                for handle in handles:
-                    handle.wait()
-
-                future.result()
-
-            print(f"update_rollout_engine time: {time.time() - start_time}")
-
-        torch.distributed.barrier()
-
-    def _generate_sequences_with_rollout_engine(self, prompts: TensorDict) -> dict[str, any]:
-        self._update_rollout_engine()
-
-        response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
-
-        unpadded_input_ids = [ids[ids != 3].tolist() for ids in prompts["input_ids"]]
-
-        outputs = self.rollout_engine.generate(
-            input_ids=unpadded_input_ids,
-            sampling_params={"max_new_tokens": response_length, "temperature": 0.0},
-        )
-
-        ids = []
-        texts = []
-        lengths = []
-        for output in outputs:
-            output_ids = output["output_ids"]
-            ids.append(output_ids)
-            texts.append(output["text"])
-            lengths.append(len(output_ids))
-
-        return {
-            "input_ids": unpadded_input_ids,
-            "output_ids": ids,
-            "texts": texts,
-            "lengths": lengths,
-        }
-
-    def _generate_sequences_with_fsdp_engine(self, prompts: TensorDict) -> dict[str, any]:
         device_name = get_device_name()
         response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
 
@@ -1064,9 +927,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return {
             "ids": unpadded_input_ids,
             "output_ids": unpadded_output_ids,
-            "texts": None,
             "lengths": response_length,
         }
+
+    def get_state_dict_iter(self) -> Iterator[tuple[str, torch.Tensor]]:
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        per_tensor_param = (
+            (name, param.full_tensor() if isinstance(param, DTensor) else param) for name, param in params.items()
+        )
+
+        return per_tensor_param
 
 
 @EngineRegistry.register(model_type="value_model", backend=["fsdp", "fsdp2"])
