@@ -1,6 +1,6 @@
 from typing import Any
 
-from .utils import compute_token_ttr, compute_text_ttr
+from .utils import compute_text_ttr, compute_token_ttr
 
 
 def default_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[str, float]:
