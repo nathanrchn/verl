@@ -1,5 +1,7 @@
 from typing import Any
 
+from json import loads
+
 from .utils import compute_text_ttr, compute_token_ttr
 
 
@@ -23,8 +25,10 @@ def gsm8k_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[s
     true_answer = rollout_params["answer"]
 
     metrics["gsm8k_accuracy"] = 0.0
+    metrics["gsm8k_call_tool"] = 0.0
     metrics["gsm8k_call_answer_tool"] = 0.0
     if "<|tools_prefix|>" in output_text:
+        metrics["gsm8k_call_tool"] = 1.0
         tool_calls = output_text.split("<|tools_prefix|>")[1].split("<|tools_suffix|>")[0]
         tool_calls = loads(tool_calls)
         for tool_call in tool_calls:
