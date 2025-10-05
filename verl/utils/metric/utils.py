@@ -54,51 +54,35 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     return metrics
 
 
-def compute_token_ttr(outputs: list[list[int]], n: int = 1) -> float:
-    if len(outputs) == 0:
+def compute_token_ttr(sequence: list[int], n: int = 1) -> float:
+    if len(sequence) < n:
         return 0.0
 
-    ttr_sum = 0.0
-    valid_count = 0
+    ngrams = []
+    for i in range(len(sequence) - n + 1):
+        ngram = tuple(sequence[i : i + n])
+        ngrams.append(ngram)
 
-    for sequence in outputs:
-        if len(sequence) < n:
-            continue
-
-        ngrams = []
-        for i in range(len(sequence) - n + 1):
-            ngram = tuple(sequence[i : i + n])
-            ngrams.append(ngram)
-
-        if len(ngrams) > 0:
-            ttr = len(set(ngrams)) / len(ngrams)
-            ttr_sum += ttr
-            valid_count += 1
-
-    return ttr_sum / valid_count if valid_count > 0 else 0.0
+    if len(ngrams) > 0:
+        ttr = len(set(ngrams)) / len(ngrams)
+        return ttr
+    
+    return 0.0
 
 
-def compute_text_ttr(texts: list[str], n: int = 1) -> float:
-    if len(texts) == 0:
+def compute_text_ttr(text: str, n: int = 1) -> float:
+    words = text.split()
+
+    if len(words) < n:
         return 0.0
 
-    ttr_sum = 0.0
-    valid_count = 0
+    ngrams = []
+    for i in range(len(words) - n + 1):
+        ngram = tuple(words[i : i + n])
+        ngrams.append(ngram)
 
-    for text in texts:
-        words = text.split()
-
-        if len(words) < n:
-            continue
-
-        ngrams = []
-        for i in range(len(words) - n + 1):
-            ngram = tuple(words[i : i + n])
-            ngrams.append(ngram)
-
-        if len(ngrams) > 0:
-            ttr = len(set(ngrams)) / len(ngrams)
-            ttr_sum += ttr
-            valid_count += 1
-
-    return ttr_sum / valid_count if valid_count > 0 else 0.0
+    if len(ngrams) > 0:
+        ttr = len(set(ngrams)) / len(ngrams)
+        return ttr
+    
+    return 0.0

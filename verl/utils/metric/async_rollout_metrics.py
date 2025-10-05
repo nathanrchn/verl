@@ -44,6 +44,9 @@ class AsyncRolloutMetrics:
         self.compute_metrics_step = 0
         self.compute_metrics_future = None
 
+        # Consume all the data to avoid having tokenizers issues
+        self.batched_data = [batch for batch in self.rollout_dataloader]
+
     def _build_rollout_dataloader(self):
         self.rollout_dataloader = DataLoader(
             self.rollout_dataset,
@@ -140,7 +143,7 @@ class AsyncRolloutMetrics:
 
     def _async_compute_metrics(self) -> dict[str, float]:
         metrics = {}
-        for batch in self.rollout_dataloader:
+        for batch in self.batched_data:
             unpadded_input_ids = [ids[ids != self.pad_token_id].tolist() for ids in batch["input_ids"]]
             sampling_params = [self._get_sampling_params(rollout_param) for rollout_param in batch["rollout_params"]]
 

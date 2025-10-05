@@ -16,8 +16,6 @@
 import os
 from functools import partial
 
-from verl.utils.metric.async_rollout_metrics import AsyncRolloutMetrics
-
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -34,6 +32,7 @@ from tqdm import tqdm
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler
+from verl.utils.metric.async_rollout_metrics import AsyncRolloutMetrics
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import get_device_name, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group
@@ -41,7 +40,6 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.logger import log_with_rank
 from verl.utils.tracking import Tracking
 from verl.utils.dataset.rl_dataset import collate_fn
-from verl.utils.metric.rollout_metrics import RolloutMetrics
 
 if is_cuda_available:
     pass
@@ -120,24 +118,14 @@ class SFTTrainer:
     def _build_engine(self):
         from verl.workers.engine import BaseEngine, EngineRegistry
 
-        # Prepare engine creation arguments
-        engine_args = {
-            "model_type": "language_model",
-            "backend": self.engine_config.strategy,
-            "model_config": self.model_config,
-            "engine_config": self.engine_config,
-            "optimizer_config": self.optimizer_config,
-            "checkpoint_config": self.checkpoint_config,
-        }
-
-        # Add rollout configuration if enabled
-        if self.rollout_url is not None:
-            engine_args["rollout_url"] = self.rollout_url
-
-            if self.rank == 0:
-                print(f"SFT Trainer: Rollout engine enabled with url: {self.rollout_url}")
-
-        self.engine: BaseEngine = EngineRegistry.new(**engine_args)
+        self.engine: BaseEngine = EngineRegistry.new(
+            model_type="language_model",
+            backend=self.engine_config.strategy,
+            model_config=self.model_config,
+            engine_config=self.engine_config,
+            optimizer_config=self.optimizer_config,
+            checkpoint_config=self.checkpoint_config,
+        )
 
     def _init_engine(self):
         # patch optimizer config
@@ -250,6 +238,7 @@ class SFTTrainer:
             torch.distributed.all_reduce(
                 total_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
             )
+            val_data.pop("rollout_params")
             with self.engine.eval_mode():
                 # construct tensordict
                 val_data = tu.get_tensordict(
@@ -288,8 +277,10 @@ class SFTTrainer:
                 "val/entropy": val_entropy.detach().item(),
             }
             if self.rollout_metrics is not None:
-                rollout_metrics, rollout_step = self.rollout_metrics.wait_compute_metrics()
-                tracking.log(data=rollout_metrics, step=rollout_step)
+                rollout_metrics, rollout_step = self.rollout_metrics.async_compute_metrics(global_step)
+                print(f"{rollout_metrics=}")
+                if rollout_metrics:
+                    tracking.log(data=rollout_metrics, step=rollout_step)
             tracking.log(data=metric, step=global_step)
             last_valid_metric = metric
         torch.distributed.barrier()
@@ -358,6 +349,7 @@ class SFTTrainer:
                 global_step += 1
 
                 # construct tensordict
+                data.pop("rollout_params")
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
 
                 total_tokens = data["response_mask"].sum().to(self.device_name)
@@ -420,7 +412,8 @@ class SFTTrainer:
                     if is_logging:
                         if self.rollout_metrics is not None:
                             rollout_metrics, rollout_step = self.rollout_metrics.wait_compute_metrics()
-                            tracking.log(data=rollout_metrics, step=rollout_step)
+                            if rollout_metrics:
+                                tracking.log(data=rollout_metrics, step=rollout_step)
 
                         print(f"Total time for train steps: {train_time:.2f}s")
                         print(f"Final validation metrics: {last_valid_metric}")
