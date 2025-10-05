@@ -178,7 +178,9 @@ def gsm8k_to_standard_format(x):
         ]
     )
     o["tools"] = dumps([ANSWERS_TOOL])
-    o["rollout_params"] = dumps({"id": "gsm8k", "answer": x["answer"].split("#### ")[-1]})
+    o["rollout_params"] = dumps(
+        {"id": "gsm8k", "answer": x["answer"].split("#### ")[-1], "sampling_params": {"skip_special_tokens": False}}
+    )
     o["enable_thinking"] = False
     return o
 
