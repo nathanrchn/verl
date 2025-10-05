@@ -81,7 +81,8 @@ class Tracking:
                 mode="offline",
             )
             self.logger["wandb"] = wandb
-            self.wandb_metrics = set()
+            self.wandb_cache = []
+            self.wandb_step = -1
 
         if "trackio" in default_backend:
             import trackio
@@ -167,24 +168,35 @@ class Tracking:
                 if default_backend == "wandb":
                     import wandb
 
-                    # Allow past steps to be logged
-                    for metric in data:
-                        if metric not in self.wandb_metrics:
-                            wandb.define_metric(metric, step_metric="step")
-                            self.wandb_metrics.add(metric)
+                    if step >= self.wandb_step:
+                        self.wandb_cache.append((step, data))
+                        self.wandb_step = step
+                    else:
+                        self.wandb_cache.append((step, data))
 
-                    logger_instance.log(data={**data, "step": step})
+                        data_per_step = {}
+                        for step, data in self.wandb_cache:
+                            if step not in data_per_step:
+                                data_per_step[step] = {}
+                            data_per_step[step].update(data)
+
+                        list_data = list(data_per_step.items())
+                        list_data.sort(key=lambda x: x[0])
+
+                        for step, data in list_data:
+                            logger_instance.log(data=data, step=step)
+                        self.wandb_cache = []
+
                 else:
                     logger_instance.log(data=data, step=step)
 
         if "wandb" in self.logger and time.time() - self.last_sync_time > SYNC_INTERVAL:
-            wandb_dir = os.path.join(self.default_local_dir, "wandb")
-            run_dir = os.path.join(wandb_dir, [d for d in os.listdir(wandb_dir) if d.startswith("offline")][0])
-            subprocess.Popen(["wandb", "sync", run_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _sync_offline_wandb(self.logger["wandb"], self.default_local_dir)
             self.last_sync_time = time.time()
 
     def __del__(self):
         if "wandb" in self.logger:
+            _sync_offline_wandb(self.logger["wandb"], self.default_local_dir)
             self.logger["wandb"].finish(exit_code=0)
         if "swanlab" in self.logger:
             self.logger["swanlab"].finish()
@@ -499,3 +511,8 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+def _sync_offline_wandb(wandb, default_local_dir):
+    wandb_dir = os.path.join(default_local_dir, "wandb")
+    run_dir = os.path.join(wandb_dir, [d for d in os.listdir(wandb_dir) if d.startswith("offline")][0])
+    subprocess.Popen(["wandb", "sync", run_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
