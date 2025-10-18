@@ -141,7 +141,7 @@ def humaneval_to_standard_format(x):
                 "stop": ["\nclass", "\ndef", "\n#", "\nif", "\nprint"],
                 "n": 10,
             },
-            "apply_chat_template_kwargs": {"continue_final_message": True},
+            "apply_chat_template_kwargs": {"continue_assistant_message": True},
         }
     )
     o["enable_thinking"] = False
