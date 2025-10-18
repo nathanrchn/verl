@@ -143,7 +143,7 @@ class AsyncRolloutMetrics:
 
     def _async_compute_metrics(self) -> dict[str, float]:
         metrics = {}
-        for batch in self.batched_data:
+        for i, batch in enumerate(self.batched_data):
             unpadded_input_ids = [ids[ids != self.pad_token_id].tolist() for ids in batch["input_ids"]]
             sampling_params = [self._get_sampling_params(rollout_param) for rollout_param in batch["rollout_params"]]
 
@@ -154,6 +154,9 @@ class AsyncRolloutMetrics:
                     "sampling_params": sampling_params,
                 },
             ).json()
+
+            if i == len(self.batched_data) - 1:
+                print(f"{[output['text'] for output in outputs]=}")
 
             for output, rollout_param in zip(outputs, batch["rollout_params"], strict=False):
                 task_id = rollout_param.get("id", None)
