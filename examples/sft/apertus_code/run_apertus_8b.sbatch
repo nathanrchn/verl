@@ -109,6 +109,9 @@ export HYDRA_FULL_ERROR=1
 
 cd $WORK_DIR
 
+pip install --upgrade pip setuptools wheel --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+pip install evaluate --retries 3 --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+
 pip install -e . --no-cache-dir --no-deps
 
 torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --master_addr=$head_node --master_port=$MASTER_PORT \

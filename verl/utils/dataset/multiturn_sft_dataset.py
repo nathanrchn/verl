@@ -491,7 +491,8 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
             messages,
             tools=tools,
             enable_thinking=enable_thinking,
-            add_generation_prompt=self.add_generation_prompt,
+            add_generation_prompt=self.add_generation_prompt
+            and not rollout_apply_chat_template_kwargs.get("continue_final_message", False),
             chat_template=CHAT_TEMPLATE,
             padding="max_length",
             max_length=self.max_length,

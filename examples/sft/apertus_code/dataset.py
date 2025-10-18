@@ -3,7 +3,7 @@ from json import loads, dumps
 from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset
 
-INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures/apertus-sft-code-1"
+INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/apertus-sft-code-1"
 OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-sft-code-1"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
@@ -120,7 +120,7 @@ def humaneval_to_standard_format(x):
                 "role": "assistant",
                 "content": {
                     "blocks": [
-                        {"type": "response", "text": f"Here is the completed function:\n```python\n{x['solution']}\n"}
+                        {"type": "response", "text": f"Here is the completed function:\n```python\n{x['prompt']}\n"}
                     ]
                 },
             },
@@ -151,7 +151,7 @@ def humaneval_to_standard_format(x):
 humaneval_dataset = load_dataset("openai/openai_humaneval", split="test").map(
     humaneval_to_standard_format,
     num_proc=64,
-    remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
+    remove_columns=["task_id", "prompt", "canonical_solution", "test", "entry_point"],
 )
 
 rollout_dataset = humaneval_dataset
