@@ -17,8 +17,11 @@ import torch
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.utils import tensordict_utils as tu
+from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.torch_functional import masked_mean
 from verl.workers.config import ActorConfig, CriticConfig
+from verl.workers.roles.utils.padding import no_padding_2_padding
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -32,6 +35,10 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     log_prob = model_output["log_probs"]
     entropy = model_output.get("entropy", None)
+
+    log_prob = no_padding_2_padding(log_prob, data)  # (bsz, response_length)
+    if entropy is not None:
+        entropy = no_padding_2_padding(entropy, data)  # (bsz, response_length)
 
     metrics = {}
 
@@ -86,7 +93,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=None):
     vpreds = model_output["values"]
-    values = data["values"]
+    vpreds = no_padding_2_padding(vpreds, data)  # (bsz, response_length)
 
     values = data["values"]
     returns = data["returns"]

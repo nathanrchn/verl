@@ -64,8 +64,13 @@ class FSDPOptimizerConfig(OptimizerConfig):
         num_cycles (float): Number of cosine cycles in LR schedule.
     """
 
+    _mutable_fields = OptimizerConfig._mutable_fields.copy()
+    _mutable_fields.add("lr_scheduler_type")
+
     min_lr_ratio: Optional[float] = None
-    warmup_style: str = "constant"
+    # deprecate warmup_style
+    warmup_style: Optional[str] = None
+    lr_scheduler_type: str = "constant"
     num_cycles: float = 0.5
 
     def __post_init__(self):

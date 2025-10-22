@@ -74,7 +74,8 @@ class SFTTrainer:
 
         self._build_ckpt_handler()
 
-        self.ckpt_handler.load_checkpoint()
+        # Initialize resume-related variables
+        self.resume_global_step = self.ckpt_handler.load_checkpoint()
 
         self.device_name = self.config.trainer.device
 
@@ -151,8 +152,15 @@ class SFTTrainer:
     def _build_dataset(self):
         config = self.config
         tokenizer = self.model_config.tokenizer
-        train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
-        val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
+        train_dataset = create_sft_dataset(
+            config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
+        )
+        if config.data.val_files:
+            val_dataset = create_sft_dataset(
+                config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
+            )
+        else:
+            val_dataset = None
 
         if hasattr(config.data, "rollout_files") and config.data.rollout_files is not None:
             if self.rank == 0:
@@ -186,6 +194,7 @@ class SFTTrainer:
 
         self.global_batch_size = config.data.train_batch_size
         self.train_batch_size_per_dp = self.global_batch_size // dp_size
+        self.collate_fn = SFTTensorCollator(config.data.pad_mode)
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
@@ -324,6 +333,7 @@ class SFTTrainer:
         start_epoch = global_step // self.steps_per_epoch
 
         meta_info = {
+            "use_remove_padding": self.config.model.use_remove_padding,
             "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
             "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
             "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
@@ -334,6 +344,7 @@ class SFTTrainer:
         last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info)
 
         train_time = 0
+        total_tokens = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
 
@@ -434,7 +445,7 @@ def main(config):
     run_sft(config)
 
 
-def create_sft_dataset(data_paths, data_config, tokenizer):
+def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
     """Create a dataset."""
     # build dataset
     # First check if a custom dataset class is specified
@@ -447,7 +458,7 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
         dataset_cls = MultiTurnSFTDataset
 
     # Create datasets based on the selected class
-    dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
+    dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config, max_samples=max_samples)
     return dataset
 
 
