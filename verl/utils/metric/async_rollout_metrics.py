@@ -1,5 +1,5 @@
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, Iterator
 
 import torch
@@ -21,6 +21,13 @@ DEFAULT_SAMPLING_PARAMS = {
 }
 
 
+def _compute_metrics_worker(output: dict[str, Any], rollout_param: dict[str, Any]) -> dict[str, float]:
+    """Worker function to compute metrics for a single output in a separate process."""
+    task_id = rollout_param.get("id", None)
+    task_fn = get_task(task_id)
+    return task_fn(output, rollout_param)
+
+
 class AsyncRolloutMetrics:
     def __init__(
         self,
@@ -30,6 +37,7 @@ class AsyncRolloutMetrics:
         master_port: int,
         rollout_batch_size: int,
         pad_token_id: int,
+        num_metric_workers: int = 16,
     ):
         self.rollout_dataset = rollout_dataset
         self.rollout_url = rollout_url
@@ -37,12 +45,16 @@ class AsyncRolloutMetrics:
         self.master_port = master_port
         self.rollout_batch_size = rollout_batch_size
         self.pad_token_id = pad_token_id
+        self.num_metric_workers = num_metric_workers
 
         self._build_rollout_dataloader()
         self._init_weight_update_group()
 
         self.compute_metrics_step = 0
         self.compute_metrics_future = None
+
+        # Create process pool for metric computation
+        self.metric_executor = ProcessPoolExecutor(max_workers=num_metric_workers)
 
         # Consume all the data to avoid having tokenizers issues
         self.batched_data = [batch for batch in self.rollout_dataloader]
@@ -156,14 +168,23 @@ class AsyncRolloutMetrics:
             ).json()
 
             if i == len(self.batched_data) - 1:
-                print(f"{[output['text'] for output in outputs]=}")
+                print(f"{[output['text'] for output in outputs][:32]=}")
 
+            # if we do pass@k
+            len_batch = len(batch["rollout_params"])
+            if len(outputs) != len_batch and len(outputs) % len_batch == 0:
+                n = len(outputs) // len_batch
+                outputs = [outputs[j:j+n] for j in range(0, len(outputs), n)]
+
+            # Submit metric computation tasks to separate processes
+            futures = []
             for output, rollout_param in zip(outputs, batch["rollout_params"], strict=False):
-                task_id = rollout_param.get("id", None)
-                task_fn = get_task(task_id)
+                future = self.metric_executor.submit(_compute_metrics_worker, output, rollout_param)
+                futures.append(future)
 
-                new_metrics = task_fn(output, rollout_param)
-
+            # Collect results from all processes
+            for future in futures:
+                new_metrics = future.result()
                 for metric_name, metric_value in new_metrics.items():
                     if metric_name not in metrics:
                         metrics[metric_name] = []
@@ -175,3 +196,12 @@ class AsyncRolloutMetrics:
                 aggregated_metrics[f"rollout/{metric_name}"] = sum(values) / len(values)
 
         return aggregated_metrics
+
+    def shutdown(self):
+        """Shutdown the metric computation process pool."""
+        if hasattr(self, "metric_executor"):
+            self.metric_executor.shutdown(wait=True)
+
+    def __del__(self):
+        """Cleanup when the object is destroyed."""
+        self.shutdown()

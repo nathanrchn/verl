@@ -6,13 +6,13 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=02:00:00
 #SBATCH --exclusive
-#SBATCH --nodes=9
+#SBATCH --nodes=17
 #SBATCH --partition=normal
 #SBATCH --environment=verl_swiss
 #SBATCH --output=logs/%j/log.out
 #SBATCH --error=logs/%j/log.err
 
-set -x
+set -ex
 
 # Cluster and infrastructure
 MASTER_PORT=30000
@@ -29,10 +29,10 @@ TOKENIZER_PATH="swiss-ai/Apertus-8B-Instruct-2509"
 MODEL_DTYPE="bfloat16"
 
 # Data configuration
-MICRO_BATCH_SIZE_PER_GPU=8
+MICRO_BATCH_SIZE_PER_GPU=4
 MAX_LENGTH=4096
 TRAIN_BATCH_SIZE=256
-VAL_BATCH_SIZE=32
+VAL_BATCH_SIZE=64
 ROLLOUT_BATCH_SIZE=256
 ROLLOUT_MAX_LENGTH=4096
 TRAIN_FILE="train.parquet"
@@ -46,7 +46,7 @@ LEARNING_RATE="5e-6"
 WARMUP_STYLE="linear"
 LR_WARMUP_STEPS_RATIO=0.03
 TOTAL_EPOCHS=1
-TEST_FREQ=128
+TEST_FREQ=32
 TOTAL_TRAINING_STEPS=null
 WEIGHT_DECAY=0.0
 
@@ -99,7 +99,7 @@ for local_rank in $(seq 0 $((TRAINING_NODES - 1))); do
 
     srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --output=$save_path/node_${local_rank}.log --error=$save_path/node_${local_rank}.err \
         bash --norc --noprofile -c "\
-set -x
+set -ex
 
 export no_proxy="0.0.0.0,$no_proxy"
 export NO_PROXY="0.0.0.0,$NO_PROXY"
@@ -158,7 +158,7 @@ done
 if [ "$USE_ROLLOUT" = true ]; then
     srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --output=$save_path/node_rollout.log --error=$save_path/node_rollout.err \
         bash --norc --noprofile -c "\
-set -x
+set -ex
 
 export no_proxy="0.0.0.0,$no_proxy"
 export NO_PROXY="0.0.0.0,$NO_PROXY"

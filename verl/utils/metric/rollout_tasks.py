@@ -2,7 +2,11 @@ from typing import Any
 
 import os
 from json import loads
-import evaluate as hf_evaluate
+
+try:
+    import evaluate as hf_evaluate
+except:
+    hf_evaluate = None
 
 from .utils import compute_text_ttr, compute_token_ttr
 
@@ -69,19 +73,22 @@ def gsm8k_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[s
     return metrics
 
 
-HUMANEVAL_CODE_EVAL = hf_evaluate.load("code_eval")
+if hf_evaluate is not None:
+    HUMANEVAL_CODE_EVAL = hf_evaluate.load("code_eval")
+else:
+    HUMANEVAL_CODE_EVAL = None
 
 
-def humaneval_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[str, float]:
+def humaneval_task(outputs: list[dict[str, Any]], rollout_params: dict[str, Any]) -> dict[str, float]:
     metrics = {}
-    output_text = output["text"]
+    output_texts = [output["text"] for output in outputs]
 
     pass_at_k, _ = HUMANEVAL_CODE_EVAL.compute(
         references=[f"{rollout_params['test']}\ncheck({rollout_params['entry_point']})"],
-        predictions=[[rollout_params["prompt"] + ot for ot in output_text]],
+        predictions=[[rollout_params["prompt"] + ot for ot in output_texts]],
         k=[10],
     )
-    metrics["humaneval_pass@10"] = pass_at_k["pass@10"]
+    metrics["humaneval_pass@10"] = float(pass_at_k["pass@10"])
     return metrics
 
 

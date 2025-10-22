@@ -4,15 +4,30 @@ from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset
 
 INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/apertus-sft-code-1"
-OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-sft-code-1"
+OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-sft-code-1-nothinking"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
-TRAIN_SPLIT_SIZE = 531937
-VAL_SPLIT_SIZE = 32
+TRAIN_SPLIT_SIZE = 531905
+VAL_SPLIT_SIZE = 64
 
 dataset = load_from_disk(INPUT_DATASET_PATH)["train"]
 
 dataset = dataset.shuffle(seed=42)
+
+def remove_reasoning(x):
+    for message in x["messages"]:
+        if message["role"] == "developer":
+            message["content"]["has_thinking"] = False
+        elif message["role"] == "assistant":
+            blocks = []
+            for block in message["content"]["blocks"]:
+                if block["type"] != "thoughts":
+                    blocks.append(block)
+            message["content"]["blocks"] = blocks
+    return x
+
+
+dataset = dataset.map(remove_reasoning, num_proc=64)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
@@ -138,7 +153,7 @@ def humaneval_to_standard_format(x):
                 "temperature": 0.8,
                 "top_p": 0.95,
                 "max_new_tokens": 1024,
-                "stop": ["\nclass", "\ndef", "\n#", "\nif", "\nprint"],
+                "stop": ["\nclass", "\ndef", "\n#", "\nif", "\nprint", "\n```", "<|assistant_end|>", "</s>"],
                 "n": 10,
             },
             "apply_chat_template_kwargs": {"continue_assistant_message": True},
