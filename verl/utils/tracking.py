@@ -18,10 +18,14 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import json
 import os
+import subprocess
+import time
 from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+SYNC_INTERVAL = 30  # seconds
 
 
 class Tracking:
@@ -59,6 +63,8 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self.last_sync_time = time.time()
+        self.default_local_dir = config["trainer"]["default_local_dir"]
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import wandb
@@ -66,8 +72,17 @@ class Tracking:
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
-            wandb.init(project=project_name, name=experiment_name, config=config, settings=settings)
+            wandb.init(
+                project=project_name,
+                dir=self.default_local_dir,
+                name=experiment_name,
+                config=config,
+                settings=settings,
+                mode="offline",
+            )
             self.logger["wandb"] = wandb
+            self.wandb_cache = []
+            self.wandb_step = -1
 
         if "trackio" in default_backend:
             import trackio
@@ -150,10 +165,37 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                if default_backend == "wandb":
+                    import wandb
+
+                    if step >= self.wandb_step:
+                        self.wandb_cache.append((step, data))
+                        self.wandb_step = step
+                    else:
+                        self.wandb_cache.append((step, data))
+
+                        data_per_step = {}
+                        for step, data in self.wandb_cache:
+                            if step not in data_per_step:
+                                data_per_step[step] = {}
+                            data_per_step[step].update(data)
+
+                        list_data = list(data_per_step.items())
+                        list_data.sort(key=lambda x: x[0])
+
+                        for step, data in list_data:
+                            logger_instance.log(data=data, step=step)
+                        self.wandb_cache = []
+                else:
+                    logger_instance.log(data=data, step=step)
+
+        if "wandb" in self.logger and time.time() - self.last_sync_time > SYNC_INTERVAL:
+            _sync_offline_wandb(self.logger["wandb"], self.default_local_dir)
+            self.last_sync_time = time.time()
 
     def __del__(self):
         if "wandb" in self.logger:
+            _sync_offline_wandb(self.logger["wandb"], self.default_local_dir)
             self.logger["wandb"].finish(exit_code=0)
         if "swanlab" in self.logger:
             self.logger["swanlab"].finish()
@@ -492,3 +534,9 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+
+def _sync_offline_wandb(wandb, default_local_dir):
+    wandb_dir = os.path.join(default_local_dir, "wandb")
+    run_dir = os.path.join(wandb_dir, [d for d in os.listdir(wandb_dir) if d.startswith("offline")][0])
+    subprocess.Popen(["wandb", "sync", run_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

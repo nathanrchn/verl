@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .async_rollout_metrics import AsyncRolloutMetrics
+from .rollout_tasks import get_task
 from .utils import reduce_metrics
 
-__all__ = ["reduce_metrics"]
+__all__ = ["reduce_metrics", "AsyncRolloutMetrics", "get_task"]

@@ -22,6 +22,7 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import torch
+from json import loads
 from omegaconf import ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
@@ -64,11 +65,14 @@ class MultiTurnSFTDataset(Dataset):
         self.messages_key = multiturn_config.get("messages_key", "messages")
         self.tools_key = multiturn_config.get("tools_key", "tools")
         self.enable_thinking_key = multiturn_config.get("enable_thinking_key", "enable_thinking")
+        self.rollout_params_key = multiturn_config.get("rollout_params_key", "rollout_params")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
         self.max_samples = max_samples
         assert self.truncation in ["error", "left", "right"]
+        # for rollout
+        self.add_generation_prompt = config.get("add_generation_prompt", False)
 
         if not isinstance(parquet_files, list | ListConfig):
             parquet_files = [parquet_files]
@@ -114,18 +118,30 @@ class MultiTurnSFTDataset(Dataset):
             print(f"selected {self.max_samples} random samples out of {total}")
 
         # Extract messages list from dataframe
-        self.messages = self.dataframe[self.messages_key].apply(series_to_item).tolist()
+        self.messages = (
+            self.dataframe[self.messages_key]
+            .apply(series_to_item)
+            .apply(convert_nested_value_to_list_recursive)
+            .tolist()
+        )
 
         # Extract tools list from dataframe
         if self.tools_key in self.dataframe.columns:
             self.tools = self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive).tolist()
         else:
             self.tools = None
+
         # Extract enable_thinking list from dataframe
         if self.enable_thinking_key in self.dataframe.columns:
             self.enable_thinking = self.dataframe[self.enable_thinking_key].tolist()
         else:
             self.enable_thinking = None
+
+        # Extract rollout_params list from dataframe
+        if self.rollout_params_key in self.dataframe.columns:
+            self.rollout_params = self.dataframe[self.rollout_params_key].tolist()
+        else:
+            self.rollout_params = None
 
     def __len__(self):
         return len(self.messages)
@@ -263,7 +279,7 @@ class MultiTurnSFTDataset(Dataset):
                 tools=tools,
                 tokenize=True,
                 return_tensors="pt",
-                add_generation_prompt=False,
+                add_generation_prompt=self.add_generation_prompt,
                 enable_thinking=enable_thinking,
                 **self.apply_chat_template_kwargs,
             )
@@ -387,5 +403,122 @@ class MultiTurnSFTDataset(Dataset):
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
             }
+
+
+CHAT_TEMPLATE = '{%- macro render_typescript_type(param_spec, required_params, is_nullable=false) -%}\n    {%- if param_spec.type == "array" -%}\n        {%- if param_spec[\'items\'] -%}\n            {%- if param_spec[\'items\'][\'type\'] == "string" -%}\n                {{- "string[]" }}\n            {%- elif param_spec[\'items\'][\'type\'] == "number" -%}\n                {{- "number[]" }}\n            {%- elif param_spec[\'items\'][\'type\'] == "integer" -%}\n                {{- "number[]" }}\n            {%- elif param_spec[\'items\'][\'type\'] == "boolean" -%}\n                {{- "boolean[]" }}\n            {%- else -%}\n                {%- set inner_type = render_typescript_type(param_spec[\'items\'], required_params) -%}\n                {%- if inner_type == "object | object" or inner_type|length > 50 -%}\n                    {{- "any[]" }}\n                {%- else -%}\n                    {{- inner_type + "[]" }}\n                {%- endif -%}\n            {%- endif -%}\n            {%- if param_spec.nullable -%}\n                {{- " | null" }}\n            {%- endif -%}\n        {%- else -%}\n            {{- "any[]" }}\n            {%- if param_spec.nullable -%}\n                {{- " | null" }}\n            {%- endif -%}\n        {%- endif -%}\n    {%- elif param_spec.type is defined and param_spec.type is iterable and param_spec.type is not string and param_spec.type is not mapping and param_spec.type[0] is defined -%}\n        {#- Handle array of types like ["object", "object"] from Union[dict, list] #}\n        {%- if param_spec.type | length > 1 -%}\n            {{- param_spec.type | join(" | ") }}\n        {%- else -%}\n            {{- param_spec.type[0] }}\n        {%- endif -%}\n    {%- elif param_spec.oneOf -%}\n        {#- Handle oneOf schemas - check for complex unions and fallback to any #}\n        {%- set has_object_variants = false -%}\n        {%- for variant in param_spec.oneOf -%}\n            {%- if variant.type == "object" -%}\n                {%- set has_object_variants = true -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {%- if has_object_variants and param_spec.oneOf|length > 1 -%}\n            {{- "any" }}\n        {%- else -%}\n            {%- for variant in param_spec.oneOf -%}\n                {{- render_typescript_type(variant, required_params) -}}\n                {%- if variant.description %}\n                    {{- "// " + variant.description }}\n                {%- endif -%}\n                {%- if variant.default is defined %}\n                    {{ "// default: " + variant.default|tojson }}\n                {%- endif -%}\n                {%- if not loop.last %}\n                    {{- " | " }}\n                {% endif -%}\n            {%- endfor -%}\n        {%- endif -%}\n    {%- elif param_spec.type == "string" -%}\n        {%- if param_spec.enum -%}\n            {{- \'"\' + param_spec.enum|join(\'" | "\') + \'"\' -}}\n        {%- else -%}\n            {{- "string" }}\n            {%- if param_spec.nullable %}\n                {{- " | null" }}\n            {%- endif -%}\n        {%- endif -%}\n    {%- elif param_spec.type == "number" -%}\n        {{- "number" }}\n    {%- elif param_spec.type == "integer" -%}\n        {{- "number" }}\n    {%- elif param_spec.type == "boolean" -%}\n        {{- "boolean" }}\n    {%- elif param_spec.type == "object" -%}\n        {%- if param_spec.properties -%}\n            {{- "{\\n" }}\n            {%- for prop_name, prop_spec in param_spec.properties.items() -%}\n                {{- prop_name -}}\n                {%- if prop_name not in (param_spec.required or []) -%}\n                    {{- "?" }}\n                {%- endif -%}\n                {{- ": " }}\n                {{ render_typescript_type(prop_spec, param_spec.required or []) }}\n                {%- if not loop.last -%}\n                    {{-", " }}\n                {%- endif -%}\n            {%- endfor -%}\n            {{- "}" }}\n        {%- else -%}\n            {{- "object" }}\n        {%- endif -%}\n    {%- else -%}\n        {{- "any" }}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tools(tools) -%}\n    {%- for tool in tools %}\n        {{- "// " + tool.description + "\\n" }}\n        {{- "type "+ tool.name + " = " }}\n        {%- if tool.parameters and tool.parameters.properties %}\n            {{- "(_: {\\n" }}\n            {%- for param_name, param_spec in tool.parameters.properties.items() %}\n                {%- if param_spec.description %}\n                    {{- "// " + param_spec.description + "\\n" }}\n                {%- endif %}\n                {{- param_name }}\n                {%- if param_name not in (tool.parameters.required or []) -%}\n                    {{- "?" }}\n                {%- endif -%}\n                {{- ": " }}\n                {{- render_typescript_type(param_spec, tool.parameters.required or []) }}\n                {%- if param_spec.default is defined -%}\n                    {%- if param_spec.enum %}\n                        {{- ", // default: " + param_spec.default }}\n                    {%- elif param_spec.oneOf %}\n                        {{- "// default: " + param_spec.default }}\n                    {%- else %}\n                        {{- ", // default: " + param_spec.default|tojson }}\n                    {%- endif -%}\n                {%- endif -%}\n                {%- if not loop.last %}\n                    {{- ",\\n" }}\n                {%- else %}\n                    {{- "\\n" }}\n                {%- endif -%}\n            {%- endfor %}\n            {{- "}) => any;" }}\n        {%- else -%}\n            {{- "() => any;" }}\n        {%- endif -%}\n        {%- if not loop.last -%}\n            {{- "\\n" }}\n        {%- endif -%}\n    {%- endfor %}\n{%- endmacro -%}\n\n{{ bos_token }}\n\n{%- set system_token = \'<|system_start|>\' -%}\n{%- set end_system_token = \'<|system_end|>\' -%}\n{%- set developer_token = \'<|developer_start|>\' -%}\n{%- set end_developer_token = \'<|developer_end|>\' -%}\n{%- set user_token = \'<|user_start|>\' -%}\n{%- set end_user_token = \'<|user_end|>\' -%}\n{%- set assistant_token = \'<|assistant_start|>\' -%}\n{%- set end_assistant_token = \'<|assistant_end|>\' -%}\n{%- set inner_token = \'<|inner_prefix|>\' -%}\n{%- set outer_token = \'<|inner_suffix|>\' -%}\n{%- set tool_calls_token = \'<|tools_prefix|>\' -%}\n{%- set end_tool_calls_token = \'<|tools_suffix|>\' -%}\n\n{%- set ns = namespace(in_assistant=false, in_tool=false, in_inner=false, waiting_for_tool_outputs=false, assistant_format=none) -%}\n\n{%- if messages and messages[0].role == \'system\' -%}\n    {%- if "content" in messages[0] -%}\n        {%- if messages[0].content is string -%}\n            {{ system_token + messages[0].content + end_system_token }}\n        {%- elif messages[0].content is mapping and "text" in messages[0].content -%}\n            {{ system_token + messages[0].content.text + end_system_token }}\n        {%- else -%}\n            {{- raise_exception("Invalid system message") -}}\n        {%- endif -%}\n    {%- else -%}\n        {{- raise_exception("Invalid system message") -}}\n    {%- endif -%}\n    {%- set loop_messages = messages[1:] -%}\n{%- else -%}\n    {{ system_token + \'You are Apertus, a helpful assistant created by the SwissAI initiative.\\nKnowledge cutoff: 2024-04\\nCurrent date: \' + strftime_now(\'%Y-%m-%d\') + end_system_token }}\n    {%- set loop_messages = messages -%}\n{%- endif -%}\n\n{{ developer_token + \'Deliberation: \' }}\n{%- if enable_thinking is defined and enable_thinking -%}\n    {{ \'enabled\\n\' }}\n{%- else -%}\n    {{ \'disabled\\n\' }}\n{%- endif -%}\n{%- if tools is defined and tools -%}\n    {{ \'Tool Capabilities:\\n\' + render_tools(tools) }}\n{%- else -%}\n    {{ \'Tool Capabilities: disabled\' }}\n{%- endif -%}\n{{ end_developer_token }}\n\n{%- for message in loop_messages -%}\n    {%- if message.role == \'user\' -%}\n        {%- set ns.in_inner = false -%}\n        {%- if ns.in_tool -%}\n            {{ \']\' }}\n            {%- set ns.in_tool = false -%}\n        {%- endif -%}\n        {%- if ns.in_assistant -%}\n            {{ end_assistant_token }}\n            {%- set ns.in_assistant = false -%}\n        {%- endif -%}\n        {%- if "content" in message -%}\n            {{ user_token }}\n            {%- if message.content is string -%}\n                {{ message.content }}\n            {%- elif message.content is mapping and "parts" in message.content -%}\n                {%- set parts = message.content.parts -%}\n                {%- for part in parts -%}\n                    {%- if part.type == "text" -%}\n                        {{ part.text }}\n                    {%- else -%}\n                        {{- raise_exception("Invalid user part: " + part.type) -}}\n                    {%- endif -%}\n                {%- endfor -%}\n            {%- else -%}\n                {{- raise_exception("Invalid user message: " + message.role) -}}\n            {%- endif -%}\n            {{ end_user_token }}\n        {%- endif -%}\n    {%- elif message.role == \'assistant\' -%}\n        {%- if not ns.in_assistant -%}\n            {{ assistant_token }}\n            {%- set ns.in_assistant = true -%}\n        {%- endif -%}\n        {%- if "content" in message -%}\n            {%- if message.content is string and (ns.assistant_format is none or ns.assistant_format == "string") -%}\n                {%- if ns.in_tool -%}\n                    {{ \']\' }}\n                    {%- set ns.in_tool = false -%}\n                {%- endif -%}\n                {%- set ns.assistant_format = "string" -%}\n                {{ message.content }}\n            {%- elif message.content is mapping and "blocks" in message.content and (ns.assistant_format is none or ns.assistant_format == "mapping") -%}\n                {%- set ns.assistant_format = "mapping" -%}\n                {%- set blocks = message.content.blocks -%}\n                {%- for block in blocks -%}\n                    {%- if block.type == \'thoughts\' -%}\n                        {%- if ns.in_tool -%}\n                            {{ \']\' }}\n                            {%- set ns.in_tool = false -%}\n                        {%- endif -%}\n                        {%- if not ns.in_inner -%}\n                            {%- set ns.in_inner = true -%}\n                            {{ inner_token }}\n                        {%- endif -%}\n                        {{ block.text }}\n                    {%- elif block.type == \'tool_calls\' -%}\n                        {%- if ns.in_tool -%}\n                            {{ \']\' }}\n                            {%- set ns.in_tool = false -%}\n                        {%- endif -%}\n                        {%- if ns.in_inner and not loop.first and block.calls|length == 1 and block.calls[0].name == \'display_answers\' -%}\n                            {%- set ns.in_inner = false -%}\n                            {{ outer_token }}\n                        {%- endif -%}\n                        {{ tool_calls_token + \'[\' }}\n                        {%- for tool_call in block.calls -%}\n                            {{- \'{"\' + tool_call.name + \'": \' + tool_call.arguments + \'}\' }}\n                            {%- if not loop.last -%}\n                                {{- ", " }}\n                            {%- endif -%}\n                        {%- endfor -%}\n                        {{ \']\' + end_tool_calls_token }}\n                        {%- set ns.waiting_for_tool_outputs = true -%}\n                    {%- elif block.type == \'tool_outputs\' -%}\n                        {%- if ns.in_tool -%}\n                            {{- raise_exception("Cannot have both tool outputs as separate messages and tool outputs as blocks") -}}\n                        {%- endif -%}\n                        {{ \'[\' }}\n                        {%- for tool_output in block.outputs -%}\n                            {{- tool_output.output }}\n                            {%- if not loop.last -%}\n                                {{- ", " }}\n                            {%- endif -%}\n                        {%- endfor -%}\n                        {{- \']\' }}\n                        {%- set ns.waiting_for_tool_outputs = false -%}\n                    {%- elif block.type == \'response\' -%}\n                        {%- if ns.in_tool -%}\n                            {{ \']\' }}\n                            {%- set ns.in_tool = false -%}\n                        {%- endif -%}\n                        {%- if (not loop.first and ns.in_inner) or (ns.in_assistant and ns.in_inner) -%}\n                            {%- set ns.in_inner = false -%}\n                            {{ outer_token }}\n                        {%- endif -%}\n                        {{ block.text }}\n                    {%- else -%}\n                        {{- raise_exception("Invalid assistant block type: " + block.type) -}}\n                    {%- endif -%}\n                {%- endfor -%}\n            {%- else -%}\n                {{- raise_exception("Invalid assistant content") -}}\n            {%- endif -%}\n        {%- else -%}\n            {{- raise_exception("Invalid assistant message") -}}\n        {%- endif -%}\n        {%- if "tool_calls" in message and message.tool_calls -%}\n            {{ tool_calls_token + \'[\' }}\n            {%- for tool_call in message.tool_calls -%}\n                {%- if tool_call.type == \'function\' -%}\n                    {%- set function = tool_call.function -%}\n                    {{- \'{"\' + function.name + \'": \' + function.arguments + \'}\' }}\n                    {%- if not loop.last -%}\n                        {{- ", " }}\n                    {%- endif -%}\n                {%- else -%}\n                    {{- raise_exception("Invalid tool call type: " + tool_call.type) -}}\n                {%- endif -%}\n            {%- endfor -%}\n            {{ \']\' + end_tool_calls_token }}\n            {%- set ns.waiting_for_tool_outputs = true -%}\n        {%- endif -%}\n    {%- elif message.role == \'tool\' -%}\n        {%- if not ns.in_assistant -%}\n            {{- raise_exception("Tool message outside of assistant") -}}\n        {%- endif -%}\n        {%- if not ns.in_tool -%}\n            {{ \'[\' }}\n            {%- set ns.in_tool = true -%}\n        {%- else -%}\n            {{ ", "}}\n        {%- endif -%}\n        {{ message.content }}\n        {%- set ns.waiting_for_tool_outputs = false -%}\n    {%- else -%}\n        {{- raise_exception("Invalid message role") -}}\n    {%- endif -%}\n{%- endfor -%}\n{%- if ns.in_tool -%}\n    {{ \']\' }}\n{%- endif -%}\n{%- if ns.in_assistant and not (continue_assistant_message is defined and continue_assistant_message) and not ns.waiting_for_tool_outputs -%}\n    {{ end_assistant_token }}\n{%- endif -%}\n{%- if add_generation_prompt -%}\n    {{ assistant_token }}\n{%- endif -%}\n'
+
+SYSTEM_TOKEN = 61
+END_SYSTEM_TOKEN = 62
+DEVELOPER_TOKEN = 63
+END_DEVELOPER_TOKEN = 64
+USER_TOKEN = 65
+END_USER_TOKEN = 66
+ASSISTANT_TOKEN = 67
+END_ASSISTANT_TOKEN = 68
+INNER_TOKEN = 69
+OUTER_TOKEN = 70
+TOOL_CALLS_TOKEN = 71
+END_TOOL_CALLS_TOKEN = 72
+
+
+class ApertusSFTDataset(MultiTurnSFTDataset):
+    def __init__(self, parquet_files: str | list[str], tokenizer, config=None):
+        super().__init__(parquet_files, tokenizer, config)
+
+        self.only_tools_special_tokens = config.get("only_tools_special_tokens", False)
+
+    def _special_tokens_mask(self, input_ids: np.ndarray) -> np.ndarray:
+        return (
+            (input_ids == END_ASSISTANT_TOKEN)
+            | (input_ids == INNER_TOKEN)
+            | (input_ids == OUTER_TOKEN)
+            | (input_ids == TOOL_CALLS_TOKEN)
+            | (input_ids == END_TOOL_CALLS_TOKEN)
+        )
+
+    def __getitem__(self, item):
+        tokenizer = self.tokenizer
+        messages = loads(self.messages[item]) if self.messages is not None and self.messages[item] != "" else None
+        tools = loads(self.tools[item]) if self.tools is not None and self.tools[item] != "" else None
+        enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
+        rollout_params = (
+            loads(self.rollout_params[item])
+            if self.rollout_params is not None and self.rollout_params[item] != ""
+            else {}
+        )
+        rollout_apply_chat_template_kwargs = rollout_params.get("apply_chat_template_kwargs", {})
+
+        output = tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            enable_thinking=enable_thinking,
+            add_generation_prompt=self.add_generation_prompt
+            and not rollout_apply_chat_template_kwargs.get("continue_assistant_message", False),
+            chat_template=CHAT_TEMPLATE,
+            padding="max_length",
+            max_length=self.max_length,
+            return_tensors="np",
+            return_dict=True,
+            **self.apply_chat_template_kwargs,
+            **rollout_apply_chat_template_kwargs,
+        )
+
+        input_ids = np.reshape(output["input_ids"], -1)
+        attention_mask = np.reshape(output["attention_mask"], -1)
+        attention_mask_tensor = torch.from_numpy(attention_mask)
+
+        if self.only_tools_special_tokens and tools is not None:
+            start_tool_calls = np.cumsum(input_ids == TOOL_CALLS_TOKEN, axis=0) - (
+                input_ids == TOOL_CALLS_TOKEN
+            ).astype(np.int32)
+            end_tool_calls = np.cumsum(input_ids == END_TOOL_CALLS_TOKEN, axis=0) - (
+                input_ids == END_TOOL_CALLS_TOKEN
+            ).astype(np.int32)
+            mask = np.logical_not((start_tool_calls == end_tool_calls)) | self._special_tokens_mask(input_ids)
         else:
-            raise ValueError(f"Unknown pad mode {self.pad_mode}")
+            tool_outputs_lengths = []
+            if tools is not None:
+                for message in messages:
+                    if message["role"] == "assistant":
+                        for block in message["content"]["blocks"]:
+                            if block["type"] == "tool_outputs":
+                                tool_outputs = block["outputs"]
+
+                                # We format the tool outputs as it is formatted in the chat template
+                                tool_outputs_str = (
+                                    f"[{', '.join([tool_output['output'] for tool_output in tool_outputs])}]"
+                                )
+                                tool_outputs_lengths.append(
+                                    len(tokenizer.encode(tool_outputs_str, add_special_tokens=False))
+                                )
+
+            # We use cumsum to get the different turns
+            # Then we subtract to remove the first token of each turn because we don't want to train on it
+            start_assistant = np.cumsum(input_ids == ASSISTANT_TOKEN, axis=0) - (input_ids == ASSISTANT_TOKEN).astype(
+                np.int32
+            )
+            end_assistant = np.cumsum(input_ids == END_ASSISTANT_TOKEN, axis=0) - (
+                input_ids == END_ASSISTANT_TOKEN
+            ).astype(np.int32)
+
+            # The mask is 1 if the token is not an assistant token and 0 otherwise
+            mask = start_assistant == end_assistant
+
+            if len(tool_outputs_lengths) > 0:
+                # We are searching the end of the tool calls (or the start of tool outputs) in the assistant tokens
+                end_tool_calls = (start_assistant != end_assistant) & (input_ids == END_TOOL_CALLS_TOKEN)
+
+                start_tool_output_indices = np.arange(stop=input_ids.shape[0])[end_tool_calls] + 1
+                for i, tol in zip(start_tool_output_indices, tool_outputs_lengths):
+                    mask[i : i + tol] = 1
+
+            mask = np.logical_not(mask)
+
+        return {
+            "input_ids": torch.from_numpy(input_ids),
+            "attention_mask": attention_mask_tensor,
+            "position_ids": compute_position_id_with_mask(attention_mask_tensor),
+            "responses": torch.from_numpy(input_ids[1:]),
+            "response_mask": torch.from_numpy(mask[1:].astype(np.int32)),
+            "rollout_params": rollout_params,
+        }

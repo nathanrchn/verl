@@ -25,27 +25,10 @@ from verl.workers.roles.utils.padding import no_padding_2_padding
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
-    pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-
-    log_prob = model_output["log_probs"]
-
-    if pad_mode == DatasetPadMode.NO_PADDING:
-        # log_prob and loss mask are nested tensors of shape [bsz, j1]
-        # for each sample, loss mask shape is [1, prompt_length + response_length]
-        loss_mask = data["loss_mask"]
-
-        log_prob_flatten = log_prob.values()
-        cu_seqlens = log_prob.offsets()
-        loss_mask_flatten = loss_mask.values()
-
-        # left-shift the loss mask by one token to align with log_prob
-        loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
-        loss_mask_flatten[cu_seqlens[1:] - 1] = 0
-        loss = -masked_mean(log_prob_flatten, loss_mask_flatten)
-    else:
-        response_mask = data["response_mask"].to(bool)
-        loss = -masked_mean(log_prob, response_mask)
-
+    log_prob = model_output["log_probs"]  # [bsz, response_length]
+    response_mask = data["response_mask"].to(bool)
+    loss = -masked_mean(log_prob, response_mask).float()
+    loss *= (data["response_mask"].sum() * data["num_micro_batch"] * dp_group.size()) / data["total_tokens"]
     return loss, {"loss": loss.detach().item()}
 
 

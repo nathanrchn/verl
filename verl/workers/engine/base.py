@@ -15,7 +15,7 @@
 The abstract base class defining the interface for model training engines.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 from tensordict import TensorDict
@@ -186,6 +186,18 @@ class BaseEngine:
     def is_mp_src_rank_with_outputs(self):
         """
         Whether the current rank is the first rank in model parallel group that contains model outputs
+        """
+        raise NotImplementedError
+
+    def generate_sequences(self, prompts: TensorDict) -> Any:
+        """
+        Generate sequences from the model.
+        """
+        raise NotImplementedError
+
+    def get_state_dict_iter(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """
+        Get the state dict of the model as an iterator.
         """
         raise NotImplementedError
 

@@ -18,22 +18,31 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import time
 import warnings
 from contextlib import nullcontext
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import torch
 import torch.distributed
+import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
 
+try:
+    # for torch 2.5+
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
+
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
+from verl.utils.model import convert_weight_keys
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -65,6 +74,15 @@ from verl.utils.model import convert_weight_keys
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
+
+if is_cuda_available:
+    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+elif is_npu_available:
+    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+
+from verl.trainer.config import CheckpointConfig
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
@@ -161,8 +179,10 @@ class FSDPEngine(BaseEngine):
             optimizer=self.optimizer,
             lr_scheduler=self.lr_scheduler,
             processing_class=self.model_config.get_processor(),
-            checkpoint_contents=self.checkpoint_config,
+            checkpoint_config=self.checkpoint_config,
         )
+
+        torch.distributed.barrier()
 
     def _init_device_mesh(self):
         world_size = torch.distributed.get_world_size()
@@ -182,17 +202,19 @@ class FSDPEngine(BaseEngine):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-    def _build_module(self):
-        from verl.utils.model import get_hf_auto_model_class
+    def _get_torch_dtype(self):
         from verl.utils.torch_dtypes import PrecisionType
 
         torch_dtype = self.engine_config.model_dtype
-
         if torch_dtype is None:
             # if it is training, we force torch_dtype to fp32
             torch_dtype = torch.float32 if not self.engine_config.forward_only else torch.bfloat16
+        return PrecisionType.to_dtype(torch_dtype)
 
-        torch_dtype = PrecisionType.to_dtype(torch_dtype)
+    def _build_module(self):
+        from verl.utils.model import get_hf_auto_model_class
+
+        torch_dtype = self._get_torch_dtype()
 
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
@@ -222,12 +244,12 @@ class FSDPEngine(BaseEngine):
                 fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
             )
 
-            use_fused_kernels = self.model_config.use_fused_kernels
+            self.use_fused_kernels = self.model_config.use_fused_kernels
             apply_monkey_patch(
                 model=module,
                 use_remove_padding=self.use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
-                use_fused_kernels=use_fused_kernels,
+                use_fused_kernels=self.use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
             )
 
@@ -353,18 +375,33 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_optimizer(self, module):
-        from torch import optim
+        torch_dtype = self._get_torch_dtype()
 
-        optimizer = optim.AdamW(
+        if torch_dtype == torch.bfloat16:
+            from torchao.optim import _AdamW
+
+            optimizer_cls = _AdamW
+            kwargs = {"bf16_stochastic_round": True}
+        else:
+            from torch.optim import AdamW
+
+            optimizer_cls = AdamW
+            kwargs = {}
+
+        return optimizer_cls(
             module.parameters(),
             lr=self.optimizer_config.lr,
             betas=self.optimizer_config.betas,
             weight_decay=self.optimizer_config.weight_decay,
+            **kwargs,
         )
-        return optimizer
 
     def _build_lr_scheduler(self, optimizer):
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        from verl.utils.torch_functional import (
+            get_constant_schedule_with_warmup,
+            get_linear_schedule_with_warmup,
+            get_cosine_schedule_with_warmup,
+        )
 
         optim_config = self.optimizer_config
 
@@ -382,7 +419,11 @@ class FSDPEngine(BaseEngine):
 
         if lr_scheduler_type == "constant":
             lr_scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps)
-        elif lr_scheduler_type == "cosine":
+        elif warmup_style == "linear":
+            lr_scheduler = get_linear_schedule_with_warmup(
+                optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps
+            )
+        elif warmup_style == "cosine":
             lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
                 num_warmup_steps=num_warmup_steps,
@@ -458,7 +499,7 @@ class FSDPEngine(BaseEngine):
         else:
             return torch.distributed.group.WORLD
 
-    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> TensorDict:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
 
@@ -466,27 +507,20 @@ class FSDPEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
-        output_lst = []
-
         ctx = torch.no_grad() if forward_only else nullcontext()
 
+        output_lst = []
         for micro_batch in micro_batches:
             with ctx:
+                tu.assign_non_tensor(micro_batch, num_micro_batch=len(micro_batches))
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
-                    global_bsz = data["global_batch_size"]
-                    local_micro_bsz = micro_batch.batch_size[0]
-                    # metrics contain the output, loss is dummy
-                    loss_scale_factor = local_micro_bsz / (global_bsz / self.get_data_parallel_size())
-                    # scale loss
-                    loss = loss * loss_scale_factor
                     loss.backward()
 
             output_lst.append(meta_info)
 
-        # postprocess and return
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        return postprocess_batch_func(output_lst, indices, data)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
@@ -701,9 +735,6 @@ class EngineTrainModeCtx:
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
-        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
-        pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-        use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         temperature = micro_batch["temperature"]
 
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
@@ -723,10 +754,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # args used to get outputs
         output_args = {}
 
-        if use_remove_padding:
-            if pad_mode == DatasetPadMode.NO_PADDING:
-                input_ids_rmpad = input_ids.values().unsqueeze(0)  # (1, total_nnz)
-                position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
+        if self.use_remove_padding:
+            input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                input_ids.unsqueeze(-1), attention_mask
+            )  # input_ids_rmpad (total_nnz, ...)
+            input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+            # unpad the position_ids to align the rotary
+            if position_ids.dim() == 3:
+                position_ids_rmpad = (
+                    index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                    .transpose(0, 1)
+                    .unsqueeze(1)
+                )  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -805,7 +845,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         extra_args = {}
-        if use_fused_kernels:
+        if self.use_fused_kernels:
             extra_args["temperature"] = temperature
             extra_args["return_dict"] = True
 
@@ -815,19 +855,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_inputs, output_args
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
-        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
-        pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-        use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         temperature = micro_batch["temperature"]
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
 
         model_output = {}
 
-        input_ids = micro_batch["input_ids"]
-        if use_remove_padding:
+        if self.use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
 
-            if use_fused_kernels:
+            if self.use_fused_kernels:
                 log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                 entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
             else:
@@ -882,8 +918,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         else:  # not using rmpad and no ulysses sp
-            response_length = tu.get_non_tensor_data(data=micro_batch, key="max_response_length", default=1024)
-            if use_fused_kernels:
+            if self.use_fused_kernels:
                 log_probs = output.log_probs[:, -response_length - 1 : -1]
                 entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
@@ -953,6 +988,49 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
             return loss, output
 
+    def generate_sequences(self, prompts: TensorDict) -> dict[str, any]:
+        device_name = get_device_name()
+        response_length = tu.unwrap_non_tensor_data(prompts.get("response_length", 128))
+
+        input_ids = prompts["input_ids"].to(device_name)
+        attention_mask = prompts["attention_mask"].to(device_name)
+        _, prompt_length = input_ids.shape
+
+        self.module.eval()
+
+        with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            sequences = self.module.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=response_length,
+                eos_token_id=[2, 68, 71],  # TODO: fix this
+                pad_token_id=3,  # TODO: fix this
+                do_sample=False,
+                use_cache=True,
+                return_dict_in_generate=True,
+            ).sequences
+
+        prompt_ids = sequences[:, :prompt_length]
+        output_ids = sequences[:, prompt_length:]
+
+        unpadded_input_ids = [ids[ids != 3].tolist() for ids in prompt_ids]
+        unpadded_output_ids = [ids[ids != 3].tolist() for ids in output_ids]
+
+        return {
+            "ids": unpadded_input_ids,
+            "output_ids": unpadded_output_ids,
+            "lengths": response_length,
+        }
+
+    def get_state_dict_iter(self) -> Iterator[tuple[str, torch.Tensor]]:
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        per_tensor_param = (
+            (name, param.full_tensor() if isinstance(param, DTensor) else param) for name, param in params.items()
+        )
+
+        return per_tensor_param
+
 
 @EngineRegistry.register(model_type="value_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
@@ -961,10 +1039,9 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
     """
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
-        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
-        pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        response_length = micro_batch["responses"].size(-1)
 
-        if use_remove_padding:
+        if self.use_remove_padding:
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
 

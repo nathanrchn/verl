@@ -117,4 +117,9 @@ class FSDPEngineConfig(BaseConfig):
     strategy: str = "fsdp"
 
     def __post_init__(self):
+        from verl.utils.torch_dtypes import PrecisionType
+
         assert self.strategy in ["fsdp", "fsdp2"], f"strategy {self.strategy} not supported"
+
+        if PrecisionType.is_bf16(self.model_dtype):
+            assert self.strategy == "fsdp", f"bf16 dtype requires fsdp strategy, got {self.strategy}"
