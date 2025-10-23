@@ -92,10 +92,32 @@ def humaneval_task(outputs: list[dict[str, Any]], rollout_params: dict[str, Any]
     return metrics
 
 
+def humaneval_thinking_task(outputs: list[dict[str, Any]], rollout_params: dict[str, Any]) -> dict[str, float]:
+    metrics = {}
+    output_texts = [output["text"] for output in outputs]
+
+    def extract_code(text: str) -> str:
+        if "```python" not in text:
+            return ""
+        code = text.split("```python")[1].split("```")[0]
+        if "```" in code:
+            code = code.split("```")[0]
+        return code.strip()
+
+    pass_at_k, _ = HUMANEVAL_CODE_EVAL.compute(
+        references=[f"{rollout_params['test']}\ncheck({rollout_params['entry_point']})"],
+        predictions=[[extract_code(ot) for ot in output_texts]],
+        k=[10],
+    )
+    metrics["humaneval_thinking_pass@10"] = float(pass_at_k["pass@10"])
+    return metrics
+
+
 TASK_REGISTRY = {
     "default": default_task,
     "gsm8k": gsm8k_task,
     "humaneval": humaneval_task,
+    "humaneval_thinking": humaneval_thinking_task,
 }
 
 

@@ -22,10 +22,12 @@ DEFAULT_SAMPLING_PARAMS = {
 
 
 def _compute_metrics_worker(output: dict[str, Any], rollout_param: dict[str, Any]) -> dict[str, float]:
-    """Worker function to compute metrics for a single output in a separate process."""
-    task_id = rollout_param.get("id", None)
-    task_fn = get_task(task_id)
-    return task_fn(output, rollout_param)
+    metrics = {}
+    task_ids = rollout_param.get("id", None).split(",")
+    task_fns = [get_task(task_id) for task_id in task_ids]
+    for task_fn in task_fns:
+        metrics.update(task_fn(output, rollout_param))
+    return metrics
 
 
 class AsyncRolloutMetrics:
@@ -174,7 +176,7 @@ class AsyncRolloutMetrics:
             len_batch = len(batch["rollout_params"])
             if len(outputs) != len_batch and len(outputs) % len_batch == 0:
                 n = len(outputs) // len_batch
-                outputs = [outputs[j:j+n] for j in range(0, len(outputs), n)]
+                outputs = [outputs[j : j + n] for j in range(0, len(outputs), n)]
 
             # Submit metric computation tasks to separate processes
             futures = []

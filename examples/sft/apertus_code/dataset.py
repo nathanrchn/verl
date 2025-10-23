@@ -1,10 +1,10 @@
 import os
 from json import loads, dumps
 from transformers import AutoTokenizer
-from datasets import load_from_disk, load_dataset
+from datasets import load_from_disk, load_dataset, concatenate_datasets
 
 INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/apertus-sft-code-1"
-OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-sft-code-1-nothinking"
+OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-sft-code-1"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
 TRAIN_SPLIT_SIZE = 531905
@@ -13,6 +13,7 @@ VAL_SPLIT_SIZE = 64
 dataset = load_from_disk(INPUT_DATASET_PATH)["train"]
 
 dataset = dataset.shuffle(seed=42)
+
 
 def remove_reasoning(x):
     for message in x["messages"]:
@@ -169,7 +170,53 @@ humaneval_dataset = load_dataset("openai/openai_humaneval", split="test").map(
     remove_columns=["task_id", "prompt", "canonical_solution", "test", "entry_point"],
 )
 
-rollout_dataset = humaneval_dataset
+
+def humaneval_thinking_to_standard_format(x):
+    o = {}
+    o["messages"] = dumps(
+        [
+            {"role": "system", "content": {"text": ""}},
+            {
+                "role": "user",
+                "content": {
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": f"Write a solution to the following problem and make sure that it passes the tests:\n```python\n{x['prompt']}\n```\n",
+                        }
+                    ]
+                },
+            },
+        ]
+    )
+    o["tools"] = dumps([])
+    o["rollout_params"] = dumps(
+        {
+            "id": "humaneval_thinking",
+            "task_id": x["task_id"],
+            "test": x["test"],
+            "prompt": x["prompt"],
+            "entry_point": x["entry_point"],
+            "sampling_params": {
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "max_new_tokens": 2048,
+                "n": 10,
+            },
+            "apply_chat_template_kwargs": {"continue_assistant_message": True},
+        }
+    )
+    o["enable_thinking"] = True
+    return o
+
+
+humaneval_thinking_dataset = load_dataset("openai/openai_humaneval", split="test").map(
+    humaneval_thinking_to_standard_format,
+    num_proc=64,
+    remove_columns=["task_id", "prompt", "canonical_solution", "test", "entry_point"],
+)
+
+rollout_dataset = concatenate_datasets([humaneval_dataset, humaneval_thinking_dataset])
 
 print(train_dataset)
 print(val_dataset)
