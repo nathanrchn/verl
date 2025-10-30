@@ -14,16 +14,18 @@ from .utils import compute_text_ttr, compute_token_ttr
 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
 
-def default_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[str, float]:
+def default_task(output: dict[str, Any] | list[dict[str, Any]], rollout_params: dict[str, Any]) -> dict[str, float]:
     metrics = {}
-    output_ids = output["output_ids"]
-    output_text = output["text"]
-
-    metrics["token_ttr"] = compute_token_ttr(output_ids)
-    metrics["token_3gram_ttr"] = compute_token_ttr(output_ids, 3)
-    metrics["text_ttr"] = compute_text_ttr(output_text)
-    metrics["length"] = len(output_ids)
-
+    if isinstance(output, dict):
+        output_ids = output["output_ids"]
+        output_text = output["text"]
+        metrics["token_ttr"] = compute_token_ttr(output_ids)
+        metrics["token_3gram_ttr"] = compute_token_ttr(output_ids, 3)
+        metrics["text_ttr"] = compute_text_ttr(output_text)
+        metrics["length"] = len(output_ids)
+    else:
+        for o in output:
+            metrics.update(default_task(o, rollout_params))
     return metrics
 
 
@@ -96,12 +98,18 @@ def humaneval_thinking_task(outputs: list[dict[str, Any]], rollout_params: dict[
     metrics = {}
     output_texts = [output["text"] for output in outputs]
 
+    metrics["format_ratio"] = 0.0
+    for output_text in output_texts:
+        if "```python" in output_text and "```" in output_text.split("```python")[1]:
+            metrics["format_ratio"] += 1
+    metrics["format_ratio"] /= len(output_texts)
+
     def extract_code(text: str) -> str:
+        if "<|inner_suffix|>" in text:
+            text = text.split("<|inner_suffix|>")[1] # skip the thinking part
         if "```python" not in text:
             return ""
         code = text.split("```python")[1].split("```")[0]
-        if "```" in code:
-            code = code.split("```")[0]
         return code.strip()
 
     pass_at_k, _ = HUMANEVAL_CODE_EVAL.compute(

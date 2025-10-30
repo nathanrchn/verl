@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=apertus-sft-8b-2509
-#SBATCH --cpus-per-task=288
-#SBATCH --gres=gpu:4
 #SBATCH --account=a-infra01
-#SBATCH --ntasks-per-node=1
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --exclusive
 #SBATCH --nodes=17
+#SBATCH --gpus-per-node=4
+#SBATCH --ntasks-per-node=5
+#SBATCH --mem=460800
 #SBATCH --partition=normal
-#SBATCH --environment=verl_swiss
 #SBATCH --output=logs/%j/log.out
 #SBATCH --error=logs/%j/log.err
+#SBATCH --exclude=nid006634,nid006701,nid006948,nid006588,nid006629,nid006910,nid007254,nid007078,nid006619,nid006840,nid006905,nid006941,nid006947,nid006922,nid007074,nid007131,nid007189,nid007129,nid007184,nid007176,nid007177,nid007183,nid007090,nid007551,nid007531,nid007539,nid007558,nid006988,nid006990,nid006987,nid006989,nid007363,nid006606,nid007410,nid007096,nid007566,nid006774,nid007343,nid006867,nid007323,nid007489,nid006676,nid006677,nid007411,nid006848,nid006681,nid007626,nid007612,nid006887,nid006577,nid006729,nid006831,nid007520,nid007589,nid007614,nid006955,nid007592,nid007344
 
 set -ex
 
@@ -30,7 +30,7 @@ MODEL_DTYPE="bfloat16"
 
 # Data configuration
 MICRO_BATCH_SIZE_PER_GPU=4
-MAX_LENGTH=4096
+MAX_LENGTH=8192
 TRAIN_BATCH_SIZE=256
 VAL_BATCH_SIZE=64
 ROLLOUT_BATCH_SIZE=256
@@ -46,7 +46,7 @@ LEARNING_RATE="5e-6"
 WARMUP_STYLE="linear"
 LR_WARMUP_STEPS_RATIO=0.03
 TOTAL_EPOCHS=1
-TEST_FREQ=32
+TEST_FREQ=128
 TOTAL_TRAINING_STEPS=null
 WEIGHT_DECAY=0.0
 
@@ -83,6 +83,16 @@ dataset_path=$DATASET_PATH
 mkdir -p "$save_path"
 cp "$0" "$save_path/run_apertus_8b.sbatch"
 
+# Build project wheel once on the head node and store it in a shared location
+WHEEL_DIR="$save_path/wheels"
+mkdir -p "$WHEEL_DIR"
+srun --nodes=1 --ntasks=1 --nodelist=$head_node --container-writable --environment=verl_swiss --kill-on-bad-exit=1 --output=$save_path/wheel_build.log --error=$save_path/wheel_build.err \
+    bash --norc --noprofile -c "\
+set -ex
+cd $WORK_DIR
+pip wheel . --no-cache-dir --no-deps -w $WHEEL_DIR"
+PACKAGE_WHEEL=$(ls -t "$WHEEL_DIR"/*.whl | head -n1)
+
 if [ "$USE_ROLLOUT" = true ]; then
     rollout_node=${nodes[-1]}
     rollout_node_ip=$(srun --nodes=1 --ntasks=1 --nodelist=$rollout_node hostname -i)
@@ -97,9 +107,17 @@ fi
 for local_rank in $(seq 0 $((TRAINING_NODES - 1))); do
     node=${nodes[$local_rank]}
 
-    srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --output=$save_path/node_${local_rank}.log --error=$save_path/node_${local_rank}.err \
+    if [ "$local_rank" -eq 0 ]; then
+        install_command="pip install /iopsstor/scratch/cscs/nathanrchn/evaluate-0.4.6-py3-none-any.whl"
+    else
+        install_command=""
+    fi
+
+    srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=verl_swiss --kill-on-bad-exit=1 --output=$save_path/node_${local_rank}.log --error=$save_path/node_${local_rank}.err \
         bash --norc --noprofile -c "\
 set -ex
+
+echo $node
 
 export no_proxy="0.0.0.0,$no_proxy"
 export NO_PROXY="0.0.0.0,$NO_PROXY"
@@ -109,12 +127,11 @@ export HYDRA_FULL_ERROR=1
 
 cd $WORK_DIR
 
-pip install --upgrade pip setuptools wheel --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
-pip install evaluate --retries 3 --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+$install_command
 
-pip install -e . --no-cache-dir --no-deps
+pip install $PACKAGE_WHEEL --no-cache-dir --no-deps --force-reinstall
 
-torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --master_addr=$head_node --master_port=$MASTER_PORT \
+torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --master_addr=$head_node_ip --master_port=$MASTER_PORT \
     -m verl.trainer.sft_trainer \
     data.train_files=$dataset_path/$TRAIN_FILE \
     data.val_files=$dataset_path/$VAL_FILE \
@@ -156,19 +173,36 @@ torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --m
 done
 
 if [ "$USE_ROLLOUT" = true ]; then
-    srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --output=$save_path/node_rollout.log --error=$save_path/node_rollout.err \
+
+    for i in $(seq 0 3); do
+        port=$((50000 + i))
+        srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --environment=verl_swiss --kill-on-bad-exit=1 --gpus-per-task=1 --cpus-per-task=50 --gpu-bind=map_gpu:${i} --overlap --output=$save_path/node_rollout_$i.log --error=$save_path/node_rollout_$i.err \
+            bash --norc --noprofile -c "\
+set -ex
+
+export no_proxy="0.0.0.0,$no_proxy"
+export NO_PROXY="0.0.0.0,$NO_PROXY"
+
+export NCCL_DEBUG=WARN
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=$i
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --dtype=bfloat16 --host=0.0.0.0 --port=$port --decode-log-interval=1 --skip-server-warmup --random-seed 42" &
+    done
+
+    srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --environment=sglang_router --kill-on-bad-exit=1 --cpus-per-task=50 --overlap --output=$save_path/node_rollout_router.log --error=$save_path/node_rollout_router.err \
         bash --norc --noprofile -c "\
 set -ex
 
 export no_proxy="0.0.0.0,$no_proxy"
 export NO_PROXY="0.0.0.0,$NO_PROXY"
 
-export NCCL_DEBUG=INFO
-
-python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --host=0.0.0.0 --port=30000 --decode-log-interval 1 --skip-server-warmup --random-seed 42
-" &
+python -m sglang_router.launch_router --host 0.0.0.0 --port 30000 --worker-urls http://${rollout_node_ip}:50000 http://${rollout_node_ip}:50001 http://${rollout_node_ip}:50002 http://${rollout_node_ip}:50003 --model-path $ROLLOUT_MODEL_PATH" &
 fi
 
-wait
+wait -n
+scancel $SLURM_JOB_ID
 
 echo "[FINISHED]"

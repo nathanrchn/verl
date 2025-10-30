@@ -266,18 +266,13 @@ class SFTTrainer:
         if self.rollout_dataset:
             params = self.engine.get_state_dict_iter()
 
-            if self.rank == 0:
-                self.rollout_metrics.update_rollout_engine(params)
-
-        torch.distributed.barrier()
-
         if is_logging:
             metric = {
                 "val/loss": val_loss.detach().item(),
                 "val/entropy": val_entropy.detach().item(),
             }
             if self.rollout_metrics is not None:
-                rollout_metrics, rollout_step = self.rollout_metrics.async_compute_metrics(global_step)
+                rollout_metrics, rollout_step = self.rollout_metrics.async_compute_metrics(global_step, params)
                 print(f"{rollout_metrics=}")
                 if rollout_metrics:
                     tracking.log(data=rollout_metrics, step=rollout_step)

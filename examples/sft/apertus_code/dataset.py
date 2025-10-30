@@ -9,6 +9,7 @@ MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
 TRAIN_SPLIT_SIZE = 531905
 VAL_SPLIT_SIZE = 64
+SEQ_LENGTH = 8192
 
 dataset = load_from_disk(INPUT_DATASET_PATH)["train"]
 
@@ -28,7 +29,7 @@ def remove_reasoning(x):
     return x
 
 
-dataset = dataset.map(remove_reasoning, num_proc=64)
+# dataset = dataset.map(remove_reasoning, num_proc=64)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
@@ -102,18 +103,38 @@ def convert_to_standard_format(x):
     return o
 
 
-train_dataset = dataset.select(range(TRAIN_SPLIT_SIZE)).map(
+dataset = dataset.map(
     convert_to_standard_format,
     num_proc=64,
     remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
 )
 
+def remove_excess_tokens(x):
+    input_ids = tokenizer.apply_chat_template(
+        loads(x["messages"]),
+        tools=loads(x["tools"]) if x["tools"] is not None and x["tools"] != "" else None,
+        enable_thinking=x["enable_thinking"],
+    )
+
+    if len(input_ids) > SEQ_LENGTH:
+        for message in loads(x["messages"]):
+            if message["role"] == "developer":
+                message["content"]["has_thinking"] = False
+            elif message["role"] == "assistant":
+                blocks = []
+                for block in message["content"]["blocks"]:
+                    if block["type"] != "thoughts":
+                        blocks.append(block)
+                message["content"]["blocks"] = blocks
+
+    return x
+
+dataset = dataset.map(remove_excess_tokens, num_proc=256)
+
+train_dataset = dataset.select(range(TRAIN_SPLIT_SIZE))
+
 val_offset = TRAIN_SPLIT_SIZE + 1
-val_dataset = dataset.select(range(val_offset, val_offset + VAL_SPLIT_SIZE)).map(
-    convert_to_standard_format,
-    num_proc=64,
-    remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
-)
+val_dataset = dataset.select(range(val_offset, val_offset + VAL_SPLIT_SIZE))
 
 
 def humaneval_to_standard_format(x):
@@ -192,7 +213,7 @@ def humaneval_thinking_to_standard_format(x):
     o["tools"] = dumps([])
     o["rollout_params"] = dumps(
         {
-            "id": "humaneval_thinking",
+            "id": "default,humaneval_thinking",
             "task_id": x["task_id"],
             "test": x["test"],
             "prompt": x["prompt"],
@@ -200,10 +221,11 @@ def humaneval_thinking_to_standard_format(x):
             "sampling_params": {
                 "temperature": 0.8,
                 "top_p": 0.95,
-                "max_new_tokens": 2048,
+                "max_new_tokens": 32768,
                 "n": 10,
+                "skip_special_tokens": False,
             },
-            "apply_chat_template_kwargs": {"continue_assistant_message": True},
+            "apply_chat_template_kwargs": {},
         }
     )
     o["enable_thinking"] = True
@@ -216,7 +238,7 @@ humaneval_thinking_dataset = load_dataset("openai/openai_humaneval", split="test
     remove_columns=["task_id", "prompt", "canonical_solution", "test", "entry_point"],
 )
 
-rollout_dataset = concatenate_datasets([humaneval_dataset, humaneval_thinking_dataset])
+rollout_dataset = humaneval_thinking_dataset # concatenate_datasets([humaneval_dataset, humaneval_thinking_dataset])
 
 print(train_dataset)
 print(val_dataset)
