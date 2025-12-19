@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from typing import Callable, Iterator, Optional
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
@@ -249,6 +250,8 @@ class FSDPEngine(BaseEngine):
 
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
+
+            # module = torch.compile(module, dynamic=True)
 
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -490,13 +493,17 @@ class FSDPEngine(BaseEngine):
         ctx = torch.no_grad() if forward_only else nullcontext()
 
         output_lst = []
-        for micro_batch in micro_batches:
+        for micro_idx, micro_batch in enumerate(micro_batches):
             with ctx:
                 tu.assign_non_tensor(micro_batch, num_micro_batch=len(micro_batches))
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                # emit_nvtx() automatically wraps all PyTorch ops with NVTX ranges
+                with torch.autograd.profiler.emit_nvtx(record_shapes=True):
+                    with nvtx.range(f"forward_step_{micro_idx}"):
+                        loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
-                if not forward_only:
-                    loss.backward()
+                    if not forward_only:
+                        with nvtx.range(f"backward_step_{micro_idx}"):
+                            loss.backward()
 
             output_lst.append(meta_info)
 

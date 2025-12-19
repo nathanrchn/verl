@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=apertus-sft-8b-2509
-#SBATCH --account=a-infra01
-#SBATCH --time=04:00:00
+#SBATCH --account=infra01
+#SBATCH --time=01:30:00
 #SBATCH --exclusive
 #SBATCH --nodes=17
 #SBATCH --gpus-per-node=4
@@ -10,7 +10,7 @@
 #SBATCH --partition=normal
 #SBATCH --output=logs/%j/log.out
 #SBATCH --error=logs/%j/log.err
-#SBATCH --exclude=nid006634,nid006701,nid006948,nid006588,nid006629,nid006910,nid007254,nid007078,nid006619,nid006840,nid006905,nid006941,nid006947,nid006922,nid007074,nid007131,nid007189,nid007129,nid007184,nid007176,nid007177,nid007183,nid007090,nid007551,nid007531,nid007539,nid007558,nid006988,nid006990,nid006987,nid006989,nid007363,nid006606,nid007410,nid007096,nid007566,nid006774,nid007343,nid006867,nid007323,nid007489,nid006676,nid006677,nid007411,nid006848,nid006681,nid007626,nid007612,nid006887,nid006577,nid006729,nid006831,nid007520,nid007589,nid007614,nid006955,nid007592,nid007344
+#SBATCH --exclude=nid006634,nid006701,nid006948,nid006588,nid006629,nid006910,nid007254,nid007078,nid006619,nid006840,nid006905,nid006941,nid006947,nid006922,nid007074,nid007131,nid007189,nid007129,nid007184,nid007176,nid007177,nid007183,nid007090,nid007551,nid007531,nid007539,nid007558,nid006988,nid006990,nid006987,nid006989,nid007363,nid006606,nid007410,nid007096,nid007566,nid006774,nid007343,nid006867,nid007323,nid007489,nid006676,nid006677,nid007411,nid006848,nid006681,nid007626,nid007612,nid006887,nid006577,nid006729,nid006831,nid007520,nid007589,nid007614,nid006955,nid007592,nid007344,nid007374,nid007134,nid007628,nid007382,nid007141
 
 set -ex
 
@@ -173,7 +173,6 @@ torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --m
 done
 
 if [ "$USE_ROLLOUT" = true ]; then
-
     for i in $(seq 0 3); do
         port=$((50000 + i))
         srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --environment=verl_swiss --kill-on-bad-exit=1 --gpus-per-task=1 --cpus-per-task=50 --gpu-bind=map_gpu:${i} --overlap --output=$save_path/node_rollout_$i.log --error=$save_path/node_rollout_$i.err \

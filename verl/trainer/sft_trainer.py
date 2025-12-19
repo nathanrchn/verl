@@ -23,6 +23,8 @@ import logging
 
 import hydra
 import torch
+import torch.cuda
+import torch.cuda.nvtx as nvtx
 import torch.distributed
 from codetiming import Timer
 from omegaconf import OmegaConf
@@ -298,6 +300,16 @@ class SFTTrainer:
         global_step = self.resume_global_step  # Start from resumed step
         last_valid_metric = None
 
+        # Profiling configuration
+        profile_start_step = getattr(self.config.trainer, "profile_start_step", 0)
+        profile_steps = getattr(self.config.trainer, "profile_steps", 0)
+        profile_end_step = profile_start_step + profile_steps if profile_steps > 0 else 0
+        profiling_active = False
+        profiling_done = False
+
+        if profile_steps > 0 and is_logging:
+            print(f"Profiling enabled: will profile steps {profile_start_step + 1} to {profile_end_step}")
+
         log_with_rank(
             f"Total training steps: {self.total_training_steps},",
             logger=logger,
@@ -332,18 +344,34 @@ class SFTTrainer:
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
 
-            for step_in_epoch, data in enumerate(
-                tqdm(
-                    self.train_dataloader,
-                    initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
-                    total=self.steps_per_epoch,
-                    desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
-                    disable=not is_logging,
-                )
-            ):
+            data_iter = iter(self.train_dataloader)
+            pbar = tqdm(
+                range(self.steps_per_epoch),
+                initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
+                total=self.steps_per_epoch,
+                desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
+                disable=not is_logging,
+            )
+            for _ in pbar:
                 global_step += 1
 
-                # construct tensordict
+                # Start profiling at the configured step
+                if profile_steps > 0 and global_step == profile_start_step + 1 and not profiling_done:
+                    torch.cuda.cudart().cudaProfilerStart()
+                    profiling_active = True
+                    if is_logging:
+                        print(f"[Step {global_step}] Started CUDA profiler")
+
+                # Profile data loading
+                if profiling_active:
+                    nvtx.range_push("data_loading")
+                data = next(data_iter)
+                if profiling_active:
+                    nvtx.range_pop()
+
+                # Profile data preprocessing
+                if profiling_active:
+                    nvtx.range_push("data_preprocessing")
                 data.pop("rollout_params")
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
 
@@ -352,12 +380,26 @@ class SFTTrainer:
                     total_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
                 )
                 tu.assign_non_tensor(data, total_tokens=total_tokens.item())
+                if profiling_active:
+                    nvtx.range_pop()
 
                 with self.engine.train_mode():
                     with Timer(name="update_policy", logger=None) as timer:
+                        # Profile forward + backward + optimizer step
+                        if profiling_active:
+                            nvtx.range_push("train_batch")
                         output = self.engine.train_batch(data=data, loss_function=self.loss_fn)
-                lr = self.engine.lr_scheduler_step()
+                        if profiling_active:
+                            nvtx.range_pop()
 
+                if profiling_active:
+                    nvtx.range_push("lr_scheduler_step")
+                lr = self.engine.lr_scheduler_step()
+                if profiling_active:
+                    nvtx.range_pop()
+
+                if profiling_active:
+                    nvtx.range_push("metrics_computation")
                 if self.engine.is_mp_src_rank_with_outputs():
                     output_metrics = output["metrics"]
 
@@ -391,6 +433,17 @@ class SFTTrainer:
 
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)
+                if profiling_active:
+                    nvtx.range_pop()
+
+                # Stop profiling after the configured number of steps
+                if profiling_active and global_step >= profile_end_step:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
+                    profiling_active = False
+                    profiling_done = True
+                    if is_logging:
+                        print(f"[Step {global_step}] Stopped CUDA profiler - profile data saved")
 
                 is_last_step = global_step >= self.total_training_steps
                 is_valid_step = global_step % self.test_freq == 0

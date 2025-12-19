@@ -61,13 +61,16 @@ def add_answer_tool_if_missing(x):
             for block in message["content"]["blocks"]:
                 if block["type"] == "tool_calls":
                     for call in block["calls"]:
-                        if call["name"] == "display_answer":
+                        if call["name"] == "display_answers":
                             uses_answer_tool = True
                             break
                 if uses_answer_tool:
                     break
             if uses_answer_tool:
                 break
+
+    if not uses_answer_tool:
+        return x
 
     assert developer_message is not None
     tools_str = developer_message["content"]["tools"]
@@ -79,7 +82,7 @@ def add_answer_tool_if_missing(x):
             break
     if not has_answer_tool:
         tools.append(ANSWERS_TOOL)
-    x["tools"] = dumps(tools) if tools else ""
+    developer_message["content"]["tools"] = dumps(tools) if tools else ""
     return x
 
 
@@ -238,7 +241,51 @@ humaneval_thinking_dataset = load_dataset("openai/openai_humaneval", split="test
     remove_columns=["task_id", "prompt", "canonical_solution", "test", "entry_point"],
 )
 
-rollout_dataset = humaneval_thinking_dataset # concatenate_datasets([humaneval_dataset, humaneval_thinking_dataset])
+def mbpp_thinking_to_standard_format(x):
+    o = {}
+    o["messages"] = dumps(
+        [
+            {"role": "system", "content": {"text": ""}},
+            {
+                "role": "user",
+                "content": {
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": f"You are an expert Python programmer, and here is your task:\n{x['prompt']}\nYour code should pass these tests:\n{'\n'.join(x['test_list'])}",
+                        }
+                    ]
+                },
+            },
+        ]
+    )
+    o["tools"] = dumps([])
+    o["rollout_params"] = dumps(
+        {
+            "id": "default,mbpp_thinking",
+            "task_id": x["task_id"],
+            "prompt": x["prompt"],
+            "test_imports": x["test_imports"],
+            "test_list": x["test_list"],
+            "sampling_params": {
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "max_new_tokens": 32768,
+                "skip_special_tokens": False,
+            },
+            "apply_chat_template_kwargs": {},
+        }
+    )
+    o["enable_thinking"] = True
+    return o
+
+mbpp_thinking_dataset = load_dataset("google-research-datasets/mbpp", name="sanitized", split="test").map(
+    mbpp_thinking_to_standard_format,
+    num_proc=64,
+    remove_columns=["source_file", "task_id", "prompt", "code", "test_imports", "test_list"],
+)
+
+rollout_dataset = humaneval_dataset # concatenate_datasets([humaneval_thinking_dataset, mbpp_thinking_dataset])
 
 print(train_dataset)
 print(val_dataset)
