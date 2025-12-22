@@ -3,16 +3,12 @@ from json import loads, dumps
 from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset, concatenate_datasets
 
-INPUT_DATASET_PATH = (
-    "/capstor/store/cscs/swissai/infra01/posttrain_data/06_sft_mixtures_newformat_linearised/apertus-sft-mixture-8e"
-)
-OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/debug-apertus-sft-mixture-8e-with-eval-full"
+INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/format-following-1"
+OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-1"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
-TRAIN_SPLIT_SIZE = 3_938_000
-VAL_SPLIT_SIZE = 2048
-ROLLOUT_SPLIT_SIZE = 256
-ROLLOUT_MAX_LENGTH = 512
+TRAIN_SPLIT_SIZE = 65000
+VAL_SPLIT_SIZE = 724
 
 dataset = load_from_disk(INPUT_DATASET_PATH)["train"]
 
@@ -133,40 +129,40 @@ val_dataset = dataset.select(range(val_offset, val_offset + VAL_SPLIT_SIZE)).map
 )
 
 
-def filter_messages(x):
-    input_ids = tokenizer.apply_chat_template(
-        loads(x["messages"]),
-        tools=loads(x["tools"]) if x["tools"] is not None and x["tools"] != "" else None,
-        enable_thinking=x["enable_thinking"],
-        add_generation_prompt=True,
-    )
+# def filter_messages(x):
+#     input_ids = tokenizer.apply_chat_template(
+#         loads(x["messages"]),
+#         tools=loads(x["tools"]) if x["tools"] is not None and x["tools"] != "" else None,
+#         enable_thinking=x["enable_thinking"],
+#         add_generation_prompt=True,
+#     )
 
-    return len(input_ids) < ROLLOUT_MAX_LENGTH
-
-
-def remove_last_message(x):
-    x["messages"] = dumps(loads(x["messages"])[:-1])
-    return x
+#     return len(input_ids) < ROLLOUT_MAX_LENGTH
 
 
-def add_rollout_params(x):
-    x["rollout_params"] = dumps({"id": "default"})
-    return x
+# def remove_last_message(x):
+#     x["messages"] = dumps(loads(x["messages"])[:-1])
+#     return x
 
 
-rollout_offset = val_offset + VAL_SPLIT_SIZE + 1
-rollout_dataset = (
-    dataset.skip(rollout_offset)
-    .map(
-        convert_to_standard_format,
-        num_proc=64,
-        remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
-    )
-    .filter(filter_messages, num_proc=64)
-    .select(range(ROLLOUT_SPLIT_SIZE))
-    .map(remove_last_message, num_proc=64)
-    .map(add_rollout_params, num_proc=64)
-)
+# def add_rollout_params(x):
+#     x["rollout_params"] = dumps({"id": "default"})
+#     return x
+
+
+# rollout_offset = val_offset + VAL_SPLIT_SIZE + 1
+# rollout_dataset = (
+#     dataset.skip(rollout_offset)
+#     .map(
+#         convert_to_standard_format,
+#         num_proc=64,
+#         remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
+#     )
+#     .filter(filter_messages, num_proc=64)
+#     .select(range(ROLLOUT_SPLIT_SIZE))
+#     .map(remove_last_message, num_proc=64)
+#     .map(add_rollout_params, num_proc=64)
+# )
 
 
 def gsm8k_to_standard_format(x):
@@ -189,7 +185,24 @@ gsm8k_dataset = load_dataset("openai/gsm8k", name="main", split="test").map(
     gsm8k_to_standard_format, num_proc=64, remove_columns=["question", "answer"]
 )
 
-rollout_dataset = concatenate_datasets([rollout_dataset, gsm8k_dataset])
+def ifbench_to_standard_format(x):
+    o = {}
+    o["messages"] = dumps(
+        [
+            {"role": "system", "content": {"text": ""}},
+            {"role": "user", "content": {"parts": [{"type": "text", "text": x["prompt"]}]}},
+        ]
+    )
+    o["tools"] = ""
+    o["rollout_params"] = dumps({"id": "ifbench", "instruction_id_list": x["instruction_id_list"], "kwargs": x["kwargs"]})
+    o["enable_thinking"] = False
+    return o
+
+ifbench_dataset = load_dataset("allenai/IFBench_test").map(
+    ifbench_to_standard_format, num_proc=64, remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
+)
+
+rollout_dataset = concatenate_datasets([gsm8k_dataset, ifbench_dataset])
 
 print(train_dataset)
 print(val_dataset)

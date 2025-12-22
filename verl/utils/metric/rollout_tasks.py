@@ -121,11 +121,32 @@ def humaneval_thinking_task(outputs: list[dict[str, Any]], rollout_params: dict[
     return metrics
 
 
+from ifbench.instructions_registry import INSTRUCTION_DICT
+
+
+def ifbench_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[str, float]:
+    metrics = {}
+    output_text = output["text"]
+
+    results = []
+    for instruction_id, instruction_kwargs in zip(rollout_params["instruction_id_list"], rollout_params["kwargs"]):
+        instruction_cls = INSTRUCTION_DICT[instruction_id]
+        instruction_obj = instruction_cls(instruction_id)
+
+        _ = instruction_obj.build_description(**instruction_kwargs)
+        results.append(instruction_obj.check_following(output_text))
+
+    metrics["accuracy"] = float(all(results))
+
+    return metrics
+
+
 TASK_REGISTRY = {
     "default": default_task,
     "gsm8k": gsm8k_task,
     "humaneval": humaneval_task,
     "humaneval_thinking": humaneval_thinking_task,
+    "ifbench": ifbench_task,
 }
 
 
