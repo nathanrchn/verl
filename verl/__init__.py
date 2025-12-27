@@ -90,3 +90,15 @@ if is_npu_available:
             device_module.synchronize()
 
         TensorDictBase._sync_all = _sync_all_patch
+
+# # Patch torchdata compatibility with newer torch versions where _pin_memory_loop signature changed
+# try:
+#     import torch.utils.data._utils.pin_memory as pin_memory_utils
+#     import inspect
+#     if 'device' not in inspect.signature(pin_memory_utils._pin_memory_loop).parameters:
+#         _original_pin_memory_loop = pin_memory_utils._pin_memory_loop
+#         def _patched_pin_memory_loop(in_queue, out_queue, device_id, done_event, device=None):
+#             return _original_pin_memory_loop(in_queue, out_queue, device_id, done_event)
+#         pin_memory_utils._pin_memory_loop = _patched_pin_memory_loop
+# except (ImportError, AttributeError):
+#     pass

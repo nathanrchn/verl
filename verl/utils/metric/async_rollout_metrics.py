@@ -1,8 +1,9 @@
 import time
+import random
 import asyncio
 import aiohttp
 from typing import Any, Iterator
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import torch
 import torch.distributed
@@ -153,13 +154,13 @@ class AsyncRolloutMetrics:
 
         print(f"update_rollout_engine time: {time.time() - start_time}")
 
-    def wait_compute_metrics(self) -> tuple[dict[str, float], int]:
+    def wait_compute_metrics(self) -> tuple[tuple[dict[str, float], list[dict[str, Any]]], int]:
         return (
-            self.compute_metrics_future.result() if self.compute_metrics_future is not None else {},
+            self.compute_metrics_future.result() if self.compute_metrics_future is not None else ({}, []),
             self.compute_metrics_step,
         )
 
-    def async_compute_metrics(self, step: int, params: Iterator[tuple[str, torch.Tensor]]) -> tuple[Future[dict[str, float]], int]:
+    def async_compute_metrics(self, step: int, params: Iterator[tuple[str, torch.Tensor]]) -> tuple[tuple[dict[str, float], list[dict[str, Any]]], int]:
         output = self.wait_compute_metrics()
 
         self.update_rollout_engine(params)
@@ -235,16 +236,20 @@ class AsyncRolloutMetrics:
 
         return await asyncio.gather(*tasks)
 
-    def _async_compute_metrics(self) -> dict[str, float]:
+    def _async_compute_metrics(self) -> tuple[dict[str, float], list[dict[str, Any]]]:
         metrics = {}
         clip_lengths = []
         clip_degenerations = []
+        generations_data = []
+        tokenizer = self.rollout_dataset.tokenizer
         for i, batch in enumerate(self.batched_data):
             clip_length = 0
             clip_degeneration = 0
 
             unpadded_input_ids = [ids[ids != self.pad_token_id].tolist() for ids in batch["input_ids"]]
             sampling_params = [self._get_sampling_params(rollout_param) for rollout_param in batch["rollout_params"]]
+
+            input_texts = [tokenizer.decode(ids, skip_special_tokens=False) for ids in unpadded_input_ids]
 
             outputs = asyncio.run(self._async_generate_batch(unpadded_input_ids, sampling_params))
 
@@ -260,24 +265,39 @@ class AsyncRolloutMetrics:
             clip_length /= len_outputs
             clip_degeneration /= len_outputs
 
-            print(len([o['text'] for output in outputs for o in (output if isinstance(output, list) else [output])]))
-
-            if i == len(self.batched_data) - 1:
-                print(f"{[o['text'] for output in outputs for o in (output if isinstance(output, list) else [output])][:32]=}")
-
             # Submit metric computation tasks to separate processes
             futures = []
             for output, rollout_param in zip(outputs, batch["rollout_params"]):
                 future = self.process_pool.submit(_compute_metrics_worker, output, rollout_param)
-                futures.append(future)
+                futures.append((future, output, rollout_param))
 
-            # Collect results from all processes
-            for future in futures:
+            # Collect results and build detailed generation data
+            for (future, output, rollout_param), sp, input_text in zip(futures, sampling_params, input_texts):
                 new_metrics = future.result()
                 for metric_name, metric_value in new_metrics.items():
                     if metric_name not in metrics:
                         metrics[metric_name] = []
                     metrics[metric_name].append(metric_value)
+
+                # Build detailed generation data for each output sample
+                output_list = output if isinstance(output, list) else [output]
+                for o in output_list:
+
+                    gen_data = {
+                        "task_id": rollout_param.get("id", ""),
+                        "input": input_text,
+                        "output": o["text"],
+                        "finish_reason": o["meta_info"]["finish_reason"]["type"],
+                        "metrics": new_metrics if new_metrics else {},
+                        "sampling_params": sp,
+                    }
+
+                    # Add additional metadata from rollout_param (excluding non-serializable items)
+                    for key, value in rollout_param.items():
+                        if key not in ["id", "sampling_params"] and isinstance(value, (str, int, float, bool)):
+                            gen_data[key] = value
+
+                    generations_data.append(gen_data)
 
             clip_lengths.append(clip_length)
             clip_degenerations.append(clip_degeneration)
@@ -290,7 +310,10 @@ class AsyncRolloutMetrics:
         aggregated_metrics["rollout/clip_length"] = sum(clip_lengths) / len(clip_lengths)
         aggregated_metrics["rollout/clip_degeneration"] = sum(clip_degenerations) / len(clip_degenerations)
 
-        return aggregated_metrics
+        # Sample generations for logging (limit to avoid too large tables)
+        sampled_generations = random.sample(generations_data, min(256, len(generations_data)))
+
+        return aggregated_metrics, sampled_generations
 
     def shutdown(self):
         """Shutdown the metric computation process pool."""

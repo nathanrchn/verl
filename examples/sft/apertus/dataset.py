@@ -3,12 +3,11 @@ from json import loads, dumps
 from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset, concatenate_datasets
 
-INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/format-following-1"
-OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-1"
+INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/format-following-3"
+OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-3"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
-TRAIN_SPLIT_SIZE = 65000
-VAL_SPLIT_SIZE = 724
+VAL_SPLIT_SIZE = 128
 
 dataset = load_from_disk(INPUT_DATASET_PATH)["train"]
 
@@ -115,18 +114,13 @@ def convert_to_standard_format(x):
     return o
 
 
-train_dataset = dataset.select(range(TRAIN_SPLIT_SIZE)).map(
-    convert_to_standard_format,
-    num_proc=64,
-    remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
-)
+dataset = dataset.map(convert_to_standard_format, num_proc=64, remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])))
 
-val_offset = TRAIN_SPLIT_SIZE + 1
-val_dataset = dataset.select(range(val_offset, val_offset + VAL_SPLIT_SIZE)).map(
-    convert_to_standard_format,
-    num_proc=64,
-    remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
-)
+
+train_dataset = dataset.select(range(len(dataset) - VAL_SPLIT_SIZE - 1))
+
+val_offset = len(dataset) - VAL_SPLIT_SIZE
+val_dataset = dataset.select(range(val_offset, val_offset + VAL_SPLIT_SIZE))
 
 
 # def filter_messages(x):
@@ -174,9 +168,14 @@ def gsm8k_to_standard_format(x):
         ]
     )
     o["tools"] = dumps([ANSWERS_TOOL])
-    o["rollout_params"] = dumps(
-        {"id": "gsm8k", "answer": x["answer"].split("#### ")[-1], "sampling_params": {"skip_special_tokens": False}}
-    )
+    o["rollout_params"] = dumps({
+        "id": "gsm8k",
+        "answer": x["answer"].split("#### ")[-1].replace(",", "").strip(),
+        "sampling_params": {
+            "skip_special_tokens": False,
+            "max_new_tokens": 2048,
+        },
+    })
     o["enable_thinking"] = False
     return o
 
@@ -194,11 +193,19 @@ def ifbench_to_standard_format(x):
         ]
     )
     o["tools"] = ""
-    o["rollout_params"] = dumps({"id": "ifbench", "instruction_id_list": x["instruction_id_list"], "kwargs": x["kwargs"]})
-    o["enable_thinking"] = False
+    o["rollout_params"] = dumps({
+        "id": "ifbench",
+        "instruction_id_list": x["instruction_id_list"],
+        "kwargs": x["kwargs"],
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 4096,
+        },
+    })
+    o["enable_thinking"] = True
     return o
 
-ifbench_dataset = load_dataset("allenai/IFBench_test").map(
+ifbench_dataset = load_dataset("allenai/IFBench_test", split="train").map(
     ifbench_to_standard_format, num_proc=64, remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
 )
 

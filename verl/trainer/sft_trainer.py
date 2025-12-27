@@ -14,6 +14,7 @@
 
 
 import os
+import copy
 from functools import partial
 
 os.environ["NCCL_DEBUG"] = "WARN"
@@ -40,7 +41,7 @@ from verl.utils.device import get_device_name, is_cuda_available, is_npu_availab
 from verl.utils.distributed import destroy_global_process_group
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.logger import log_with_rank
-from verl.utils.tracking import Tracking
+from verl.utils.tracking import Tracking, RolloutGenerationsLogger
 from verl.utils.dataset.rl_dataset import collate_fn
 
 if is_cuda_available:
@@ -161,8 +162,9 @@ class SFTTrainer:
                 if hasattr(config.data, "rollout_max_size") and config.data.rollout_max_size is not None:
                     config.data.max_length = config.data.rollout_max_size
 
-                config.data.add_generation_prompt = True
-                rollout_dataset = create_sft_dataset(config.data.rollout_files, config.data, tokenizer)
+                rollout_config = copy.deepcopy(config.data)
+                rollout_config.add_generation_prompt = True
+                rollout_dataset = create_sft_dataset(config.data.rollout_files, rollout_config, tokenizer)
             else:
                 rollout_dataset = True
         else:
@@ -229,7 +231,7 @@ class SFTTrainer:
         else:
             self.rollout_metrics = None
 
-    def _validate_rollout(self, is_logging, global_step, tracking, meta_info):
+    def _validate_rollout(self, is_logging, global_step, tracking, meta_info, rollout_generation_log_fn):
         last_valid_metric = None
 
         # Perform validation
@@ -274,10 +276,13 @@ class SFTTrainer:
                 "val/entropy": val_entropy.detach().item(),
             }
             if self.rollout_metrics is not None:
-                rollout_metrics, rollout_step = self.rollout_metrics.async_compute_metrics(global_step, params)
-                print(f"{rollout_metrics=}")
+                rollout_result, rollout_step = self.rollout_metrics.async_compute_metrics(global_step, params)
+                rollout_metrics, generations_data = rollout_result
                 if rollout_metrics:
+                    print(f"{rollout_metrics=}")
                     tracking.log(data=rollout_metrics, step=rollout_step)
+                if rollout_generation_log_fn is not None and generations_data:
+                    rollout_generation_log_fn(generations_data=generations_data, step=rollout_step)
             tracking.log(data=metric, step=global_step)
             last_valid_metric = metric
         torch.distributed.barrier()
@@ -289,6 +294,7 @@ class SFTTrainer:
 
         # TODO: add a unified tracking
         tracking = None
+        rollout_generation_log_fn = None
         if is_logging:
             tracking = Tracking(
                 project_name=self.config.trainer.project_name,
@@ -296,6 +302,15 @@ class SFTTrainer:
                 default_backend=self.config.trainer.logger,
                 config=OmegaConf.to_container(self.config, resolve=True),
             )
+
+            if self.rollout_metrics is not None:
+                rollout_generation_logger = RolloutGenerationsLogger(
+                    project_name=self.config.trainer.project_name,
+                    experiment_name=self.config.trainer.experiment_name,
+                    default_local_dir=self.config.trainer.default_local_dir,
+                )
+
+                rollout_generation_log_fn = partial(rollout_generation_logger.log, loggers=tracking.logger)
 
         global_step = self.resume_global_step  # Start from resumed step
         last_valid_metric = None
@@ -338,7 +353,7 @@ class SFTTrainer:
             "response_length": 256,
         }
 
-        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info)
+        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info, rollout_generation_log_fn)
 
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
@@ -451,7 +466,7 @@ class SFTTrainer:
 
                 # early exit or validation step
                 if is_last_step or (self.test_freq > 0 and is_valid_step):
-                    last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info)
+                    last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info, rollout_generation_log_fn)
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     self.ckpt_handler.save_checkpoint(step=global_step)
@@ -459,9 +474,12 @@ class SFTTrainer:
                 if is_last_step:
                     if is_logging:
                         if self.rollout_metrics is not None:
-                            rollout_metrics, rollout_step = self.rollout_metrics.wait_compute_metrics()
+                            rollout_result, rollout_step = self.rollout_metrics.wait_compute_metrics()
+                            rollout_metrics, generations_data = rollout_result
                             if rollout_metrics:
                                 tracking.log(data=rollout_metrics, step=rollout_step)
+                            if rollout_generation_log_fn is not None and generations_data:
+                                rollout_generation_log_fn(generations_data=generations_data, step=rollout_step)
 
                         print(f"Total time for train steps: {train_time:.2f}s")
                         print(f"Final validation metrics: {last_valid_metric}")

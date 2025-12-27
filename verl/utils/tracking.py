@@ -25,7 +25,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-SYNC_INTERVAL = 30  # seconds
+SYNC_INTERVAL = 5  # seconds
 
 
 class Tracking:
@@ -510,6 +510,76 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+
+@dataclasses.dataclass
+class RolloutGenerationsLogger:
+    """Logger for rollout generations that logs detailed generation data to wandb.
+
+    Each generation entry contains:
+    - task_id: The ID of the task
+    - input: The input prompt text
+    - output: The generated text
+    - metrics: Dict of all computed metrics
+    - sampling_params: Dict of sampling parameters used
+    - finish_reason: Why generation stopped (stop, length, degenerating, error)
+    - Additional metadata from rollout_params
+    """
+    project_name: str = None
+    experiment_name: str = None
+    default_local_dir: str = None
+
+    def log(self, loggers, generations_data: list[dict], step: int):
+        """Log generation data to enabled backends.
+
+        Args:
+            loggers: Dictionary of logger instances
+            generations_data: List of dicts with keys: task_id, input, output, metrics, sampling_params, finish_reason, and other metadata
+            step: Current training step
+        """
+        if "wandb" in loggers:
+            self.log_generations_to_wandb(loggers["wandb"], generations_data, step)
+
+    def log_generations_to_wandb(self, wandb, generations_data: list[dict], step: int):
+        if not generations_data:
+            return
+
+        # Collect all unique keys from the generation data
+        all_keys = set()
+        for gen in generations_data:
+            all_keys.update(gen.keys())
+
+        # Define column order: step first, then common fields, then others
+        priority_columns = ["step", "task_id", "input", "output", "metrics", "sampling_params", "finish_reason"]
+        other_columns = sorted([k for k in all_keys if k not in priority_columns])
+        columns = priority_columns + other_columns
+
+        # Create a fresh table for this step (not accumulating across steps)
+        table = wandb.Table(columns=columns)
+
+        # Add rows
+        for gen in generations_data:
+            row_data = [step]  # step column
+            for col in priority_columns[1:]:  # skip step, already added
+                value = gen.get(col, "")
+                # Convert dicts to JSON strings for wandb table display
+                if isinstance(value, dict):
+                    row_data.append(json.dumps(value))
+                else:
+                    row_data.append(value)
+            for col in other_columns:
+                value = gen.get(col, "")
+                if isinstance(value, dict):
+                    row_data.append(json.dumps(value))
+                else:
+                    row_data.append(value)
+            table.add_data(*row_data)
+
+        wandb.log({"rollout/generations": table}, step=step)
+
+        # Sync offline wandb data
+        if self.default_local_dir:
+            _sync_offline_wandb(wandb, self.default_local_dir)
 
 
 def _sync_offline_wandb(wandb, default_local_dir):

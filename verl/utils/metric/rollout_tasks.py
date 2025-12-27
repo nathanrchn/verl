@@ -24,56 +24,81 @@ def default_task(output: dict[str, Any] | list[dict[str, Any]], rollout_params: 
         metrics["text_ttr"] = compute_text_ttr(output_text)
         metrics["length"] = len(output_ids)
     else:
+        all_metrics = []
         for o in output:
-            metrics.update(default_task(o, rollout_params))
+            all_metrics.append(default_task(o, rollout_params))
+        
+        aggregated_metrics = {}
+        for metric_dict in all_metrics:
+            for key, value in metric_dict.items():
+                if key not in aggregated_metrics:
+                    aggregated_metrics[key] = []
+                aggregated_metrics[key].append(value)
+        
+        for key, values in aggregated_metrics.items():
+            metrics[key] = sum(values) / len(values)
     return metrics
 
 
-def gsm8k_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[str, float]:
+def gsm8k_task(output: dict[str, Any] | list[dict[str, Any]], rollout_params: dict[str, Any]) -> dict[str, float]:
     metrics = {}
-    output_text = output["text"]
+    
+    if isinstance(output, dict):
+        output_text = output["text"]
+        true_answer = rollout_params["answer"]
 
-    true_answer = rollout_params["answer"]
-
-    metrics["gsm8k_accuracy"] = 0.0
-    metrics["gsm8k_call_tool"] = 0.0
-    metrics["gsm8k_call_answer_tool"] = 0.0
-    metrics["gsm8k_call_tool_flexible"] = 0.0
-    metrics["gsm8k_call_answer_tool_flexible"] = 0.0
-    if "<|tools_prefix|>" in output_text:
-        try:
-            tool_calls = output_text.split("<|tools_prefix|>")[1].split("<|tools_suffix|>")[0]
-            tool_calls = loads(tool_calls)
-            metrics["gsm8k_call_tool"] = 1.0
-            for tool_call in tool_calls:
-                if "display_answers" in tool_call:
-                    arguments = tool_call["display_answers"]
-                    if "answers" in arguments:
-                        answers = arguments["answers"]
-                        for answer in answers:
-                            if answer == true_answer:
-                                metrics["gsm8k_accuracy"] = 1.0
-                                break
-                    metrics["gsm8k_call_answer_tool"] = 1.0
-                    break
-        except Exception:
+        metrics["gsm8k_accuracy"] = 0.0
+        metrics["gsm8k_call_tool"] = 0.0
+        metrics["gsm8k_call_answer_tool"] = 0.0
+        metrics["gsm8k_call_tool_flexible"] = 0.0
+        metrics["gsm8k_call_answer_tool_flexible"] = 0.0
+        if "<|tools_prefix|>" in output_text:
             try:
-                tool_call = loads(output_text.split("<|tools_prefix|>[")[1])
-                metrics["gsm8k_call_tool_flexible"] = 1.0
-                if "display_answers" in tool_call:
-                    arguments = tool_call["display_answers"]
-                    if "answers" in arguments:
-                        answers = arguments["answers"]
-                        for answer in answers:
-                            if answer == true_answer:
-                                metrics["gsm8k_accuracy"] = 1.0
-                                break
-                    metrics["gsm8k_call_answer_tool_flexible"] = 1.0
+                tool_calls = output_text.split("<|tools_prefix|>")[1].split("<|tools_suffix|>")[0]
+                tool_calls = loads(tool_calls)
+                metrics["gsm8k_call_tool"] = 1.0
+                for tool_call in tool_calls:
+                    if "display_answers" in tool_call:
+                        arguments = tool_call["display_answers"]
+                        if "answers" in arguments:
+                            answers = arguments["answers"]
+                            for answer in answers:
+                                if answer == true_answer:
+                                    metrics["gsm8k_accuracy"] = 1.0
+                                    break
+                        metrics["gsm8k_call_answer_tool"] = 1.0
+                        break
             except Exception:
-                pass
+                try:
+                    tool_call = loads(output_text.split("<|tools_prefix|>[")[1])
+                    metrics["gsm8k_call_tool_flexible"] = 1.0
+                    if "display_answers" in tool_call:
+                        arguments = tool_call["display_answers"]
+                        if "answers" in arguments:
+                            answers = arguments["answers"]
+                            for answer in answers:
+                                if answer == true_answer:
+                                    metrics["gsm8k_accuracy"] = 1.0
+                                    break
+                        metrics["gsm8k_call_answer_tool_flexible"] = 1.0
+                except Exception:
+                    pass
+    else:
+        all_metrics = []
+        for o in output:
+            all_metrics.append(gsm8k_task(o, rollout_params))
+        
+        aggregated_metrics = {}
+        for metric_dict in all_metrics:
+            for key, value in metric_dict.items():
+                if key not in aggregated_metrics:
+                    aggregated_metrics[key] = []
+                aggregated_metrics[key].append(value)
+        
+        for key, values in aggregated_metrics.items():
+            metrics[key] = sum(values) / len(values)
 
     return metrics
-
 
 if hf_evaluate is not None:
     HUMANEVAL_CODE_EVAL = hf_evaluate.load("code_eval")
@@ -121,22 +146,36 @@ def humaneval_thinking_task(outputs: list[dict[str, Any]], rollout_params: dict[
     return metrics
 
 
-from ifbench.instructions_registry import INSTRUCTION_DICT
+from .ifbench.instructions_registry import INSTRUCTION_DICT
 
 
-def ifbench_task(output: dict[str, Any], rollout_params: dict[str, Any]) -> dict[str, float]:
+def parse_non_reasoning_apertus(output_text: str) -> str:
+    if "<|inner_suffix|>" in output_text:
+        output_text = output_text.split("<|inner_suffix|>")[1] # skip the thinking part
+    return output_text.strip()
+
+
+def ifbench_task(outputs: list[dict[str, Any]], rollout_params: dict[str, Any]) -> dict[str, float]:
     metrics = {}
-    output_text = output["text"]
+    output_texts = [parse_non_reasoning_apertus(output["text"]) for output in outputs]
 
     results = []
-    for instruction_id, instruction_kwargs in zip(rollout_params["instruction_id_list"], rollout_params["kwargs"]):
-        instruction_cls = INSTRUCTION_DICT[instruction_id]
-        instruction_obj = instruction_cls(instruction_id)
+    for output_text in output_texts:
+        output_results = []
+        for instruction_id, instruction_kwargs in zip(rollout_params["instruction_id_list"], rollout_params["kwargs"]):
+            instruction_cls = INSTRUCTION_DICT[instruction_id]
+            instruction_obj = instruction_cls(instruction_id)
 
-        _ = instruction_obj.build_description(**instruction_kwargs)
-        results.append(instruction_obj.check_following(output_text))
+            _ = instruction_obj.build_description(**{k: v for k, v in instruction_kwargs.items() if v is not None})
 
-    metrics["accuracy"] = float(all(results))
+            try:
+                output_results.append(instruction_obj.check_following(output_text))
+            except Exception:
+                output_results.append(False)
+        
+        results.append(all(output_results))
+
+    metrics["ifbench_accuracy"] = float(sum(results) / len(results))
 
     return metrics
 
