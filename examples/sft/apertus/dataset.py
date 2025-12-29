@@ -3,8 +3,8 @@ from json import loads, dumps
 from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset, concatenate_datasets
 
-INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/format-following-3"
-OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-3"
+INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/format-following-5"
+OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-5"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
 VAL_SPLIT_SIZE = 128
@@ -72,13 +72,16 @@ def add_answer_tool_if_missing(x):
             for block in message["content"]["blocks"]:
                 if block["type"] == "tool_calls":
                     for call in block["calls"]:
-                        if call["name"] == "display_answer":
+                        if call["name"] == "display_answers":
                             uses_answer_tool = True
                             break
                 if uses_answer_tool:
                     break
             if uses_answer_tool:
                 break
+
+    if not uses_answer_tool:
+        return x
 
     assert developer_message is not None
     tools_str = developer_message["content"]["tools"]
@@ -90,7 +93,7 @@ def add_answer_tool_if_missing(x):
             break
     if not has_answer_tool:
         tools.append(ANSWERS_TOOL)
-    x["tools"] = dumps(tools) if tools else ""
+    developer_message["content"]["tools"] = dumps(tools) if tools else ""
     return x
 
 
@@ -184,6 +187,31 @@ gsm8k_dataset = load_dataset("openai/gsm8k", name="main", split="test").map(
     gsm8k_to_standard_format, num_proc=64, remove_columns=["question", "answer"]
 )
 
+def ifeval_to_standard_format(x):
+    o = {}
+    o["messages"] = dumps(
+        [
+            {"role": "system", "content": {"text": ""}},
+            {"role": "user", "content": {"parts": [{"type": "text", "text": x["prompt"]}]}},
+        ]
+    )
+    o["tools"] = ""
+    o["rollout_params"] = dumps({
+        "id": "ifeval",
+        "instruction_id_list": x["instruction_id_list"],
+        "kwargs": x["kwargs"],
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 2048,
+        },
+    })
+    o["enable_thinking"] = False
+    return o
+
+ifeval_dataset = load_dataset("google/IFEval", split="train").map(
+    ifeval_to_standard_format, num_proc=64, remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
+)
+
 def ifbench_to_standard_format(x):
     o = {}
     o["messages"] = dumps(
@@ -199,17 +227,17 @@ def ifbench_to_standard_format(x):
         "kwargs": x["kwargs"],
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 4096,
+            "max_new_tokens": 2048,
         },
     })
-    o["enable_thinking"] = True
+    o["enable_thinking"] = False
     return o
 
 ifbench_dataset = load_dataset("allenai/IFBench_test", split="train").map(
     ifbench_to_standard_format, num_proc=64, remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
 )
 
-rollout_dataset = concatenate_datasets([gsm8k_dataset, ifbench_dataset])
+rollout_dataset = concatenate_datasets([gsm8k_dataset, ifeval_dataset, ifbench_dataset])
 
 print(train_dataset)
 print(val_dataset)

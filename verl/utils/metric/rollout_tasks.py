@@ -146,13 +146,39 @@ def humaneval_thinking_task(outputs: list[dict[str, Any]], rollout_params: dict[
     return metrics
 
 
-from .ifbench.instructions_registry import INSTRUCTION_DICT
+from .ifeval.instructions_registry import INSTRUCTION_DICT as IFEVAL_INSTRUCTION_DICT
+from .ifbench.instructions_registry import INSTRUCTION_DICT as IFBENCH_INSTRUCTION_DICT
 
 
 def parse_non_reasoning_apertus(output_text: str) -> str:
     if "<|inner_suffix|>" in output_text:
         output_text = output_text.split("<|inner_suffix|>")[1] # skip the thinking part
     return output_text.strip()
+
+
+def ifeval_task(outputs: list[dict[str, Any]], rollout_params: dict[str, Any]) -> dict[str, float]:
+    metrics = {}
+    output_texts = [parse_non_reasoning_apertus(output["text"]) for output in outputs]
+
+    results = []
+    for output_text in output_texts:
+        output_results = []
+        for instruction_id, instruction_kwargs in zip(rollout_params["instruction_id_list"], rollout_params["kwargs"]):
+            instruction_cls = IFEVAL_INSTRUCTION_DICT[instruction_id]
+            instruction_obj = instruction_cls(instruction_id)
+
+            _ = instruction_obj.build_description(**{k: v for k, v in instruction_kwargs.items() if v is not None})
+
+            try:
+                output_results.append(instruction_obj.check_following(output_text))
+            except Exception as e:
+                print(f"Error checking instruction {instruction_id} for output {output_text}: {e}")
+                output_results.append(False)
+        
+        results.append(all(output_results))
+
+    metrics["ifeval_accuracy"] = float(sum(results) / len(results))
+    return metrics
 
 
 def ifbench_task(outputs: list[dict[str, Any]], rollout_params: dict[str, Any]) -> dict[str, float]:
@@ -163,20 +189,20 @@ def ifbench_task(outputs: list[dict[str, Any]], rollout_params: dict[str, Any]) 
     for output_text in output_texts:
         output_results = []
         for instruction_id, instruction_kwargs in zip(rollout_params["instruction_id_list"], rollout_params["kwargs"]):
-            instruction_cls = INSTRUCTION_DICT[instruction_id]
+            instruction_cls = IFBENCH_INSTRUCTION_DICT[instruction_id]
             instruction_obj = instruction_cls(instruction_id)
 
             _ = instruction_obj.build_description(**{k: v for k, v in instruction_kwargs.items() if v is not None})
 
             try:
                 output_results.append(instruction_obj.check_following(output_text))
-            except Exception:
+            except Exception as e:
+                print(f"Error checking instruction {instruction_id} for output {output_text}: {e}")
                 output_results.append(False)
         
         results.append(all(output_results))
 
     metrics["ifbench_accuracy"] = float(sum(results) / len(results))
-
     return metrics
 
 
@@ -185,6 +211,7 @@ TASK_REGISTRY = {
     "gsm8k": gsm8k_task,
     "humaneval": humaneval_task,
     "humaneval_thinking": humaneval_thinking_task,
+    "ifeval": ifeval_task,
     "ifbench": ifbench_task,
 }
 

@@ -161,7 +161,9 @@ class AsyncRolloutMetrics:
         )
 
     def async_compute_metrics(self, step: int, params: Iterator[tuple[str, torch.Tensor]]) -> tuple[tuple[dict[str, float], list[dict[str, Any]]], int]:
+        start = time.time()
         output = self.wait_compute_metrics()
+        print(f"wait_compute_metrics time: {time.time() - start}")
 
         self.update_rollout_engine(params)
 

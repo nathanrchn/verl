@@ -3,7 +3,7 @@
 #SBATCH --account=infra01
 #SBATCH --time=01:30:00
 #SBATCH --exclusive
-#SBATCH --nodes=17
+#SBATCH --nodes=18
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=5
 #SBATCH --mem=460800
@@ -20,7 +20,7 @@ WORK_DIR="/users/$(id -un)/projects/verl"
 
 # Paths
 SAVE_FOLDER="/iopsstor/scratch/cscs/$(id -un)/apertus-sft-runs"
-DATASET_PATH="/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-3"
+DATASET_PATH="/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-5"
 
 # Model configuration
 MODEL_PATH="swiss-ai/Apertus-8B-2509"
@@ -29,11 +29,11 @@ TOKENIZER_PATH="swiss-ai/Apertus-8B-Instruct-2509"
 MODEL_DTYPE="bfloat16"
 
 # Data configuration
-MICRO_BATCH_SIZE_PER_GPU=8
+MICRO_BATCH_SIZE_PER_GPU=4
 MAX_LENGTH=8192
-TRAIN_BATCH_SIZE=512
-VAL_BATCH_SIZE=128
-ROLLOUT_BATCH_SIZE=256
+TRAIN_BATCH_SIZE=256
+VAL_BATCH_SIZE=64
+ROLLOUT_BATCH_SIZE=8192
 ROLLOUT_MAX_LENGTH=4096
 TRAIN_FILE="train.parquet"
 VAL_FILE="val.parquet"
@@ -94,10 +94,12 @@ pip wheel . --no-cache-dir --no-deps -w $WHEEL_DIR"
 PACKAGE_WHEEL=$(ls -t "$WHEEL_DIR"/*.whl | head -n1)
 
 if [ "$USE_ROLLOUT" = true ]; then
-    rollout_node=${nodes[-1]}
-    rollout_node_ip=$(srun --nodes=1 --ntasks=1 --nodelist=$rollout_node hostname -i)
-    TRAINING_NODES=$((SLURM_NNODES - 1))
-    ROLLOUT_URL="http://${rollout_node_ip}:30000"
+    rollout_node1=${nodes[-1]}
+    rollout_node2=${nodes[-2]}
+    rollout_node1_ip=$(srun --nodes=1 --ntasks=1 --nodelist=$rollout_node1 hostname -i)
+    rollout_node2_ip=$(srun --nodes=1 --ntasks=1 --nodelist=$rollout_node2 hostname -i)
+    TRAINING_NODES=$((SLURM_NNODES - 2))
+    ROLLOUT_URL="http://${rollout_node1_ip}:30000"
 else
     TRAINING_NODES=$SLURM_NNODES
     ROLLOUT_URL=null
@@ -132,6 +134,8 @@ $install_command
 pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/nltk-3.9.2-py3-none-any.whl
 pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/emoji-2.15.0-py3-none-any.whl
 pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/syllapy-0.7.2-py3-none-any.whl
+pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/langdetect-1.0.9-py3-none-any.whl
+pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/immutabledict-4.2.2-py3-none-any.whl
 
 pip install $PACKAGE_WHEEL --no-cache-dir --no-deps --force-reinstall
 
@@ -177,10 +181,21 @@ torchrun --nnodes=$TRAINING_NODES --nproc_per_node=4 --node_rank=$local_rank --m
 done
 
 if [ "$USE_ROLLOUT" = true ]; then
-    for i in $(seq 0 3); do
-        port=$((50000 + i))
-        srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 --gpus-per-task=1 --cpus-per-task=50 --gpu-bind=map_gpu:${i} --overlap --output=$save_path/node_rollout_$i.log --error=$save_path/node_rollout_$i.err \
-            bash --norc --noprofile -c "\
+    WORKER_URLS=""
+    for node_idx in 1 2; do
+        if [ "$node_idx" -eq 1 ]; then
+            node=$rollout_node1
+            node_ip=$rollout_node1_ip
+        else
+            node=$rollout_node2
+            node_ip=$rollout_node2_ip
+        fi
+
+        for i in $(seq 0 3); do
+            port=$((50000 + i))
+            WORKER_URLS="${WORKER_URLS} http://${node_ip}:${port}"
+            srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 --gpus-per-task=1 --cpus-per-task=50 --gpu-bind=map_gpu:${i} --overlap --output=$save_path/node_rollout_${node_idx}_$i.log --error=$save_path/node_rollout_${node_idx}_$i.err \
+                bash --norc --noprofile -c "\
 set -ex
 
 export no_proxy="0.0.0.0,$no_proxy"
@@ -193,16 +208,17 @@ export CUDA_VISIBLE_DEVICES=$i
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
 
 python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --dtype=bfloat16 --host=0.0.0.0 --port=$port --decode-log-interval=1 --skip-server-warmup --random-seed 42" &
+        done
     done
 
-    srun --nodes=1 --ntasks=1 --nodelist=$rollout_node --container-writable --environment=sglang_router --kill-on-bad-exit=1 --cpus-per-task=50 --overlap --output=$save_path/node_rollout_router.log --error=$save_path/node_rollout_router.err \
+    srun --nodes=1 --ntasks=1 --nodelist=$rollout_node1 --container-writable --environment=sglang_router --kill-on-bad-exit=1 --cpus-per-task=50 --overlap --output=$save_path/node_rollout_router.log --error=$save_path/node_rollout_router.err \
         bash --norc --noprofile -c "\
 set -ex
 
 export no_proxy="0.0.0.0,$no_proxy"
 export NO_PROXY="0.0.0.0,$NO_PROXY"
 
-python -m sglang_router.launch_router --host 0.0.0.0 --port 30000 --worker-urls http://${rollout_node_ip}:50000 http://${rollout_node_ip}:50001 http://${rollout_node_ip}:50002 http://${rollout_node_ip}:50003 --model-path $ROLLOUT_MODEL_PATH" &
+python -m sglang_router.launch_router --host 0.0.0.0 --port 30000 --worker-urls $WORKER_URLS --model-path $ROLLOUT_MODEL_PATH" &
 fi
 
 wait -n
