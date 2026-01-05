@@ -1,48 +1,35 @@
+"""
+Dataset preparation for Apertus SFT training.
+
+Loads training data and creates rollout evaluation datasets from HuggingFace:
+- GSM8K, MATH-500, Omni-MATH, OlympiadBench (Math reasoning)
+- AVeriTeC (Fact verification)
+- IFEval, IFBench (Instruction following)
+"""
 import os
 from json import loads, dumps
 from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset, concatenate_datasets
 
+# Configuration
 INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/format-following-5"
 OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-5"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
 VAL_SPLIT_SIZE = 128
 
-dataset = load_from_disk(INPUT_DATASET_PATH)["train"]
+# =============================================================================
+# Load Main Training Dataset
+# =============================================================================
 
+dataset = load_from_disk(INPUT_DATASET_PATH)["train"]
 dataset = dataset.shuffle(seed=42)
 
-# def uses_answer_tool(x):
-#     for message in x["messages"]:
-#         if message["role"] == "assistant":
-#             for block in message["content"]["blocks"]:
-#                 if block["type"] == "tool_calls":
-#                     for call in block["calls"]:
-#                         if call["name"] == "display_answers":
-#                             return True
-#     return False
-
-# dataset = dataset.filter(uses_answer_tool, num_proc=64)
-
-# print(dataset)
-
-# def has_answer_tool(x):
-#     for message in x["messages"]:
-#         if message["role"] == "developer":
-#             tools_str = message["content"]["tools"]
-#             tools = loads(tools_str) if tools_str is not None and tools_str != "" else []
-#             for tool in tools:
-#                 if tool["name"] == "display_answers":
-#                     return True
-#     return False
-
-# dataset = dataset.filter(has_answer_tool, num_proc=64)
-
-# print(dataset)
-# exit()
-
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+
+# =============================================================================
+# Tool Definitions
+# =============================================================================
 
 ANSWERS_TOOL = {
     "name": "display_answers",
@@ -60,6 +47,38 @@ ANSWERS_TOOL = {
     },
 }
 
+# Grammar to force tool use for display_answers
+ANSWERS_TOOL_GRAMMAR = """%llguidance {}
+start: TEXT? tool_calls <|assistant_end|>
+
+tool_calls: <|tools_prefix|> %json {
+    "type": "array",
+    "minItems": 1,
+    "items": {
+        "type": "object",
+        "properties": {
+            "display_answers": {
+                "type": "object",
+                "properties": {
+                    "answers": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["answers"]
+            }
+        },
+        "required": ["display_answers"]
+    }
+} <|tools_suffix|>
+
+TEXT: /(.|\n)+/
+"""
+
+
+# =============================================================================
+# Training Data Processing
+# =============================================================================
 
 def add_answer_tool_if_missing(x):
     uses_answer_tool = False
@@ -117,132 +136,273 @@ def convert_to_standard_format(x):
     return o
 
 
-dataset = dataset.map(convert_to_standard_format, num_proc=64, remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])))
-
+dataset = dataset.map(
+    convert_to_standard_format,
+    num_proc=64,
+    remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"]))
+)
 
 train_dataset = dataset.select(range(len(dataset) - VAL_SPLIT_SIZE - 1))
-
 val_offset = len(dataset) - VAL_SPLIT_SIZE
 val_dataset = dataset.select(range(val_offset, val_offset + VAL_SPLIT_SIZE))
 
+# =============================================================================
+# Rollout Dataset Helpers
+# =============================================================================
 
-# def filter_messages(x):
-#     input_ids = tokenizer.apply_chat_template(
-#         loads(x["messages"]),
-#         tools=loads(x["tools"]) if x["tools"] is not None and x["tools"] != "" else None,
-#         enable_thinking=x["enable_thinking"],
-#         add_generation_prompt=True,
-#     )
-
-#     return len(input_ids) < ROLLOUT_MAX_LENGTH
+# System prompt for AVeriTeC fact verification
+AVERITEC_GUIDE = "Display one of the following answers: 'Supported', 'Refuted', 'Conflicting Evidence/Cherrypicking', or 'Not Enough Evidence'."
 
 
-# def remove_last_message(x):
-#     x["messages"] = dumps(loads(x["messages"])[:-1])
-#     return x
+def make_rollout_sample(
+    question: str,
+    answer: str = "",
+    task_id: str = "",
+    task_name: str = "",
+    system_prompt: str = "",
+    max_new_tokens: int = 2048,
+    with_tools: bool = True,
+    grammar: str = None,
+    extra_sampling_params: dict = None,
+    kwargs: dict = None,
+) -> dict:
+    """Create a standard rollout sample."""
+    sampling_params = {
+        "skip_special_tokens": False,
+        "max_new_tokens": max_new_tokens,
+    }
+    if extra_sampling_params:
+        sampling_params.update(extra_sampling_params)
+
+    if grammar:
+        sampling_params["ebnf"] = grammar
+    elif with_tools:
+        sampling_params["ebnf"] = ANSWERS_TOOL_GRAMMAR
+
+    rollout_params = {
+        "id": task_id,
+        "task_name": task_name,
+        "answer": answer,
+        "sampling_params": sampling_params,
+        "use_tool": with_tools,
+        "kwargs": kwargs or {},
+    }
+
+    return {
+        "messages": dumps([
+            {"role": "system", "content": {"text": system_prompt}},
+            {"role": "user", "content": {"parts": [{"type": "text", "text": question}]}},
+        ]),
+        "tools": dumps([ANSWERS_TOOL]) if with_tools else "",
+        "rollout_params": dumps(rollout_params),
+        "enable_thinking": False,
+    }
 
 
-# def add_rollout_params(x):
-#     x["rollout_params"] = dumps({"id": "default"})
-#     return x
+# =============================================================================
+# Math Evaluation Datasets
+# =============================================================================
 
-
-# rollout_offset = val_offset + VAL_SPLIT_SIZE + 1
-# rollout_dataset = (
-#     dataset.skip(rollout_offset)
-#     .map(
-#         convert_to_standard_format,
-#         num_proc=64,
-#         remove_columns=list(set(dataset.column_names) - set(["messages", "tools", "enable_thinking"])),
-#     )
-#     .filter(filter_messages, num_proc=64)
-#     .select(range(ROLLOUT_SPLIT_SIZE))
-#     .map(remove_last_message, num_proc=64)
-#     .map(add_rollout_params, num_proc=64)
-# )
-
-
+# GSM8K (HuggingFace)
 def gsm8k_to_standard_format(x):
-    o = {}
-    o["messages"] = dumps(
-        [
-            {"role": "system", "content": {"text": ""}},
-            {"role": "user", "content": {"parts": [{"type": "text", "text": x["question"]}]}},
-        ]
+    answer = x["answer"].split("#### ")[-1].replace(",", "").strip()
+    return make_rollout_sample(
+        question=x["question"],
+        answer=answer,
+        task_id="gsm8k",
+        task_name="gsm8k",
     )
-    o["tools"] = dumps([ANSWERS_TOOL])
-    o["rollout_params"] = dumps({
-        "id": "gsm8k",
-        "answer": x["answer"].split("#### ")[-1].replace(",", "").strip(),
-        "sampling_params": {
-            "skip_special_tokens": False,
-            "max_new_tokens": 2048,
-        },
-    })
-    o["enable_thinking"] = False
-    return o
 
 
 gsm8k_dataset = load_dataset("openai/gsm8k", name="main", split="test").map(
-    gsm8k_to_standard_format, num_proc=64, remove_columns=["question", "answer"]
+    gsm8k_to_standard_format,
+    num_proc=64,
+    remove_columns=["question", "answer"]
 )
+
+# MATH-500 (HuggingFace)
+def math_500_to_standard_format(x):
+    return make_rollout_sample(
+        question=x["problem"],
+        answer=x["answer"],
+        task_id="math_500",
+        task_name="math_500",
+    )
+
+
+math_500_dataset = load_dataset("HuggingFaceH4/MATH-500", split="test", trust_remote_code=True).map(
+    math_500_to_standard_format,
+    num_proc=64,
+    remove_columns=["problem", "solution", "answer", "subject", "level", "unique_id"]
+)
+
+# # Omni-MATH (HuggingFace)
+# def omni_math_to_standard_format(x):
+#     # Determine difficulty level for task name
+#     difficulty = x.get("difficulty", 5)
+#     if difficulty <= 3:
+#         task_name = "omni_math_easy"
+#     elif difficulty <= 6:
+#         task_name = "omni_math_med"
+#     else:
+#         task_name = "omni_math_hard"
+
+#     return make_rollout_sample(
+#         question=x["problem"],
+#         answer=x["answer"],
+#         task_id=task_name,
+#         task_name=task_name,
+#     )
+
+
+# omni_math_dataset = load_dataset("KbsdJames/Omni-MATH", split="test", trust_remote_code=True).map(
+#     omni_math_to_standard_format,
+#     num_proc=64,
+#     remove_columns=["domain", "difficulty", "problem", "solution", "answer", "source"]
+# )
+
+# # OlympiadBench (HuggingFace - text-only English math)
+# def olympiad_bench_to_standard_format(x):
+#     # Handle list answers
+#     answer = x["final_answer"]
+#     if isinstance(answer, list):
+#         answer = ", ".join(str(a) for a in answer)
+#     return make_rollout_sample(
+#         question=x["question"],
+#         answer=str(answer),
+#         task_id="olympiad_bench",
+#         task_name="olympiad_bench",
+#     )
+
+
+# olympiad_bench_dataset = load_dataset(
+#     "Hothan/OlympiadBench",
+#     "OE_TO_maths_en_COMP",
+#     split="train",
+#     trust_remote_code=True
+# ).map(
+#     olympiad_bench_to_standard_format,
+#     num_proc=64,
+#     remove_columns=[
+#         "id", "question", "solution", "final_answer", "context",
+#         "image_1", "image_2", "image_3", "image_4", "image_5",
+#         "image_6", "image_7", "image_8", "image_9", "modality",
+#         "difficulty", "is_multiple_answer", "unit", "answer_type",
+#         "error", "question_type", "subfield", "subject", "language"
+#     ]
+# )
+
+# =============================================================================
+# Fact Verification Datasets
+# =============================================================================
+
+# AVeriTeC (HuggingFace)
+def averitec_to_standard_format(x):
+    return make_rollout_sample(
+        question=x["claim"],
+        answer=x["label"],
+        task_id="averitec",
+        task_name="averitec",
+        system_prompt=AVERITEC_GUIDE,
+        max_new_tokens=512,
+    )
+
+
+averitec_dataset = load_dataset("pminervini/averitec", split="dev", trust_remote_code=True).map(
+    averitec_to_standard_format,
+    num_proc=64,
+    remove_columns=[
+        "cached_original_claim_url", "speaker", "required_reannotation",
+        "reporting_source", "label", "claim_types", "fact_checking_article",
+        "fact_checking_strategies", "claim", "justification", "location_ISO_code",
+        "original_claim_url", "questions", "claim_date"
+    ]
+)
+
+# =============================================================================
+# Instruction Following Datasets
+# =============================================================================
 
 def ifeval_to_standard_format(x):
-    o = {}
-    o["messages"] = dumps(
-        [
-            {"role": "system", "content": {"text": ""}},
-            {"role": "user", "content": {"parts": [{"type": "text", "text": x["prompt"]}]}},
-        ]
+    return make_rollout_sample(
+        question=x["prompt"],
+        task_id="ifeval",
+        task_name="ifeval",
+        with_tools=False,
+        extra_sampling_params={"temperature": 0},
+        kwargs={
+            "instruction_id_list": x["instruction_id_list"],
+            "instruction_kwargs": x["kwargs"],
+        }
     )
-    o["tools"] = ""
-    o["rollout_params"] = dumps({
-        "id": "ifeval",
-        "instruction_id_list": x["instruction_id_list"],
-        "kwargs": x["kwargs"],
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": 2048,
-        },
-    })
-    o["enable_thinking"] = False
-    return o
+
 
 ifeval_dataset = load_dataset("google/IFEval", split="train").map(
-    ifeval_to_standard_format, num_proc=64, remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
+    ifeval_to_standard_format,
+    num_proc=64,
+    remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
 )
+
 
 def ifbench_to_standard_format(x):
-    o = {}
-    o["messages"] = dumps(
-        [
-            {"role": "system", "content": {"text": ""}},
-            {"role": "user", "content": {"parts": [{"type": "text", "text": x["prompt"]}]}},
-        ]
+    return make_rollout_sample(
+        question=x["prompt"],
+        task_id="ifbench",
+        task_name="ifbench",
+        with_tools=False,
+        extra_sampling_params={"temperature": 0},
+        kwargs={
+            "instruction_id_list": x["instruction_id_list"],
+            "instruction_kwargs": x["kwargs"],
+        }
     )
-    o["tools"] = ""
-    o["rollout_params"] = dumps({
-        "id": "ifbench",
-        "instruction_id_list": x["instruction_id_list"],
-        "kwargs": x["kwargs"],
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": 2048,
-        },
-    })
-    o["enable_thinking"] = False
-    return o
+
 
 ifbench_dataset = load_dataset("allenai/IFBench_test", split="train").map(
-    ifbench_to_standard_format, num_proc=64, remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
+    ifbench_to_standard_format,
+    num_proc=64,
+    remove_columns=["key", "prompt", "instruction_id_list", "kwargs"]
 )
 
-rollout_dataset = concatenate_datasets([gsm8k_dataset, ifeval_dataset, ifbench_dataset])
+# =============================================================================
+# Combine All Rollout Datasets
+# =============================================================================
 
-print(train_dataset)
-print(val_dataset)
-print(rollout_dataset)
+rollout_dataset = concatenate_datasets([
+    # Math reasoning
+    gsm8k_dataset,
+    math_500_dataset,
+    # omni_math_dataset,
+    # olympiad_bench_dataset,
+    # Fact verification
+    averitec_dataset,
+    # Instruction following
+    ifeval_dataset,
+    ifbench_dataset,
+])
 
+# =============================================================================
+# Output
+# =============================================================================
+
+print("=" * 60)
+print("Dataset Summary")
+print("=" * 60)
+print(f"\nTraining dataset: {len(train_dataset)} samples")
+print(f"Validation dataset: {len(val_dataset)} samples")
+print(f"Rollout dataset: {len(rollout_dataset)} samples")
+print("\nRollout dataset breakdown:")
+print(f"  - GSM8K: {len(gsm8k_dataset)}")
+print(f"  - MATH-500: {len(math_500_dataset)}")
+# print(f"  - Omni-MATH: {len(omni_math_dataset)}")
+# print(f"  - OlympiadBench: {len(olympiad_bench_dataset)}")
+print(f"  - AVeriTeC: {len(averitec_dataset)}")
+print(f"  - IFEval: {len(ifeval_dataset)}")
+print(f"  - IFBench: {len(ifbench_dataset)}")
+
+# Save datasets
 train_dataset.to_parquet(os.path.join(OUTPUT_DATASET_PATH, "train.parquet"))
 val_dataset.to_parquet(os.path.join(OUTPUT_DATASET_PATH, "val.parquet"))
 rollout_dataset.to_parquet(os.path.join(OUTPUT_DATASET_PATH, "rollout.parquet"))
+
+print(f"\nDatasets saved to: {OUTPUT_DATASET_PATH}")

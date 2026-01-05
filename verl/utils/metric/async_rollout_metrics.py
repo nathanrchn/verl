@@ -2,6 +2,7 @@ import time
 import random
 import asyncio
 import aiohttp
+from dataclasses import asdict
 from typing import Any, Iterator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
@@ -12,11 +13,11 @@ from sglang.srt.utils import init_custom_process_group
 from sglang.utils import wait_for_server
 from torch.utils.data import DataLoader
 
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
-from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.device import get_device_name
-from verl.utils.metric.rollout_tasks import get_task
+from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.metric.utils import compute_token_ttr
+from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+from verl.utils.metric.rollout_tasks import get_task, RolloutParams, compute_default_metrics
 from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
 DEGENERATION_THRESHOLD = 0.9
@@ -27,12 +28,37 @@ DEFAULT_SAMPLING_PARAMS = {
 }
 
 
-def _compute_metrics_worker(output: dict[str, Any], rollout_param: dict[str, Any]) -> dict[str, float]:
+def _compute_metrics_worker(output: dict[str, Any], params: RolloutParams) -> dict[str, float]:
     metrics = {}
-    task_ids = rollout_param.get("id", None).split(",")
-    task_fns = [get_task(task_id) for task_id in task_ids]
-    for task_fn in task_fns:
-        metrics.update(task_fn(output, rollout_param))
+    task_name = params.task_name
+
+    # Compute default metrics (TTR, length) for single outputs
+    if isinstance(output, dict):
+        default_metrics = compute_default_metrics(output)
+        # Add global default metrics
+        metrics.update(default_metrics)
+        # Add per-benchmark default metrics
+        if task_name:
+            for key, value in default_metrics.items():
+                metrics[f"{task_name}/{key}"] = value
+    else:
+        # For list of outputs, aggregate default metrics
+        all_default_metrics = [compute_default_metrics(o) for o in output]
+        # Aggregate global default metrics
+        for key in all_default_metrics[0]:
+            values = [m[key] for m in all_default_metrics]
+            metrics[key] = sum(values) / len(values)
+            # Aggregate per-benchmark default metrics
+            if task_name:
+                metrics[f"{task_name}/{key}"] = sum(values) / len(values)
+
+    # Compute task-specific metrics
+    task_ids = params.id.split(",")
+    for task_id in task_ids:
+        task_fn = get_task(task_id)
+        if task_fn is not None:
+            metrics.update(task_fn(output, params))
+
     return metrics
 
 
@@ -171,9 +197,9 @@ class AsyncRolloutMetrics:
         self.compute_metrics_future = ThreadPoolExecutor().submit(self._async_compute_metrics)
         return output
 
-    def _get_sampling_params(self, rollout_params: dict[str, Any]) -> dict[str, Any]:
+    def _get_sampling_params(self, params: RolloutParams) -> dict[str, Any]:
         sampling_params = DEFAULT_SAMPLING_PARAMS.copy()
-        sampling_params.update(rollout_params.get("sampling_params", {}))
+        sampling_params.update(params.sampling_params)
         return sampling_params
 
     def _check_degeneration(self, output_ids: list[int]) -> bool:
@@ -248,8 +274,10 @@ class AsyncRolloutMetrics:
             clip_length = 0
             clip_degeneration = 0
 
+            batch_params = [RolloutParams.from_dict(rollout_param) for rollout_param in batch["rollout_params"]]
+
             unpadded_input_ids = [ids[ids != self.pad_token_id].tolist() for ids in batch["input_ids"]]
-            sampling_params = [self._get_sampling_params(rollout_param) for rollout_param in batch["rollout_params"]]
+            sampling_params = [self._get_sampling_params(params) for params in batch_params]
 
             input_texts = [tokenizer.decode(ids, skip_special_tokens=False) for ids in unpadded_input_ids]
 
@@ -269,37 +297,42 @@ class AsyncRolloutMetrics:
 
             # Submit metric computation tasks to separate processes
             futures = []
-            for output, rollout_param in zip(outputs, batch["rollout_params"]):
-                future = self.process_pool.submit(_compute_metrics_worker, output, rollout_param)
-                futures.append((future, output, rollout_param))
+            for output, params in zip(outputs, batch_params):
+                future = self.process_pool.submit(_compute_metrics_worker, output, params)
+                futures.append((future, output, params))
+
+            # Global default metrics to exclude from per-generation data
+            global_default_metrics = {"token_ttr", "token_3gram_ttr", "text_ttr", "length"}
 
             # Collect results and build detailed generation data
-            for (future, output, rollout_param), sp, input_text in zip(futures, sampling_params, input_texts):
+            for (future, output, params), sp, input_text in zip(futures, sampling_params, input_texts):
                 new_metrics = future.result()
                 for metric_name, metric_value in new_metrics.items():
                     if metric_name not in metrics:
                         metrics[metric_name] = []
                     metrics[metric_name].append(metric_value)
 
+                # Filter out global default metrics for per-generation logging
+                filtered_metrics = {k: v for k, v in new_metrics.items() if k not in global_default_metrics}
+
                 # Build detailed generation data for each output sample
                 output_list = output if isinstance(output, list) else [output]
                 for o in output_list:
 
-                    gen_data = {
-                        "task_id": rollout_param.get("id", ""),
+                    generation_data = {
+                        "task_id": params.id,
                         "input": input_text,
                         "output": o["text"],
                         "finish_reason": o["meta_info"]["finish_reason"]["type"],
-                        "metrics": new_metrics if new_metrics else {},
+                        "metrics": filtered_metrics if filtered_metrics else {},
                         "sampling_params": sp,
                     }
 
-                    # Add additional metadata from rollout_param (excluding non-serializable items)
-                    for key, value in rollout_param.items():
+                    for key, value in asdict(params).items():
                         if key not in ["id", "sampling_params"] and isinstance(value, (str, int, float, bool)):
-                            gen_data[key] = value
+                            generation_data[key] = value
 
-                    generations_data.append(gen_data)
+                    generations_data.append(generation_data)
 
             clip_lengths.append(clip_length)
             clip_degenerations.append(clip_degeneration)

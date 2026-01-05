@@ -477,7 +477,7 @@ class SFTTrainer:
                             rollout_result, rollout_step = self.rollout_metrics.wait_compute_metrics()
                             rollout_metrics, generations_data = rollout_result
                             if rollout_metrics:
-                                tracking.log(data=rollout_metrics, step=rollout_step)
+                                tracking.log(data=rollout_metrics, step=rollout_step, force_sync=True)
                             if rollout_generation_log_fn is not None and generations_data:
                                 rollout_generation_log_fn(generations_data=generations_data, step=rollout_step)
 

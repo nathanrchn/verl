@@ -162,7 +162,7 @@ class Tracking:
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
-    def log(self, data, step, backend=None):
+    def log(self, data, step, backend=None, force_sync=False):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 if default_backend == "wandb":
@@ -189,7 +189,7 @@ class Tracking:
                 else:
                     logger_instance.log(data=data, step=step)
 
-        if "wandb" in self.logger and time.time() - self.last_sync_time > SYNC_INTERVAL:
+        if "wandb" in self.logger and (time.time() - self.last_sync_time > SYNC_INTERVAL or force_sync):
             _sync_offline_wandb(self.logger["wandb"], self.default_local_dir)
             self.last_sync_time = time.time()
 

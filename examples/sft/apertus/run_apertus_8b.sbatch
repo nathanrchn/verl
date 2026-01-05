@@ -46,7 +46,7 @@ LEARNING_RATE="5e-6"
 WARMUP_STYLE="linear"
 LR_WARMUP_STEPS_RATIO=0.03
 TOTAL_EPOCHS=1
-TEST_FREQ=16
+TEST_FREQ=64
 TOTAL_TRAINING_STEPS=null
 WEIGHT_DECAY=0.0
 
@@ -207,7 +207,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=$i
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
 
-python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --dtype=bfloat16 --host=0.0.0.0 --port=$port --decode-log-interval=1 --skip-server-warmup --random-seed 42" &
+python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --dtype=bfloat16 --host=0.0.0.0 --port=$port --decode-log-interval=1 --skip-server-warmup --random-seed 42 --grammar-backend llguidance --mem-fraction-static 0.6 --max-running-requests 60" &
         done
     done
 
