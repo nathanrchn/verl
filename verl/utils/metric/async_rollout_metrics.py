@@ -26,6 +26,7 @@ DEFAULT_SAMPLING_PARAMS = {
     "temperature": 0.0,
     "max_new_tokens": 256,
 }
+GLOBAL_DEFAULT_METRICS = {"token_ttr", "token_3gram_ttr", "text_ttr", "length"}
 
 
 def _compute_metrics_worker(output: dict[str, Any], params: RolloutParams) -> dict[str, float]:
@@ -301,9 +302,6 @@ class AsyncRolloutMetrics:
                 future = self.process_pool.submit(_compute_metrics_worker, output, params)
                 futures.append((future, output, params))
 
-            # Global default metrics to exclude from per-generation data
-            global_default_metrics = {"token_ttr", "token_3gram_ttr", "text_ttr", "length"}
-
             # Collect results and build detailed generation data
             for (future, output, params), sp, input_text in zip(futures, sampling_params, input_texts):
                 new_metrics = future.result()
@@ -313,7 +311,7 @@ class AsyncRolloutMetrics:
                     metrics[metric_name].append(metric_value)
 
                 # Filter out global default metrics for per-generation logging
-                filtered_metrics = {k: v for k, v in new_metrics.items() if k not in global_default_metrics}
+                filtered_metrics = {k: v for k, v in new_metrics.items() if k not in GLOBAL_DEFAULT_METRICS}
 
                 # Build detailed generation data for each output sample
                 output_list = output if isinstance(output, list) else [output]
@@ -340,7 +338,8 @@ class AsyncRolloutMetrics:
         aggregated_metrics = {}
         for metric_name, values in metrics.items():
             if values:
-                aggregated_metrics[f"rollout/{metric_name}"] = sum(values) / len(values)
+                metric_name = f"rollout_{metric_name}" if metric_name not in GLOBAL_DEFAULT_METRICS else f"rollout/{metric_name}"
+                aggregated_metrics[metric_name] = sum(values) / len(values)
 
         aggregated_metrics["rollout/clip_length"] = sum(clip_lengths) / len(clip_lengths)
         aggregated_metrics["rollout/clip_degeneration"] = sum(clip_degenerations) / len(clip_degenerations)
