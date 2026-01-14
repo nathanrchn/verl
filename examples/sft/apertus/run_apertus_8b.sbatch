@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=apertus-sft-8b-2509
 #SBATCH --account=infra01
-#SBATCH --time=01:30:00
+#SBATCH --time=12:00:00
 #SBATCH --exclusive
 #SBATCH --nodes=18
 #SBATCH --gpus-per-node=4
@@ -10,7 +10,7 @@
 #SBATCH --partition=normal
 #SBATCH --output=logs/%j/log.out
 #SBATCH --error=logs/%j/log.err
-#SBATCH --exclude=nid006634,nid006701,nid006948,nid006588,nid006629,nid006910,nid007254,nid007078,nid006619,nid006840,nid006905,nid006941,nid006947,nid006922,nid007074,nid007131,nid007189,nid007129,nid007184,nid007176,nid007177,nid007183,nid007090,nid007551,nid007531,nid007539,nid007558,nid006988,nid006990,nid006987,nid006989,nid007363,nid006606,nid007410,nid007096,nid007566,nid006774,nid007343,nid006867,nid007323,nid007489,nid006676,nid006677,nid007411,nid006848,nid006681,nid007626,nid007612,nid006887,nid006577,nid006729,nid006831,nid007520,nid007589,nid007614,nid006955,nid007592,nid007344,nid007374,nid007134,nid007628,nid007382,nid007141,nid007155,nid007286,nid006589
+#SBATCH --exclude=nid006634,nid006701,nid006948,nid006588,nid006629,nid006910,nid007254,nid007078,nid006619,nid006840,nid006905,nid006941,nid006947,nid006922,nid007074,nid007131,nid007189,nid007129,nid007184,nid007176,nid007177,nid007183,nid007090,nid007551,nid007531,nid007539,nid007558,nid006988,nid006990,nid006987,nid006989,nid007363,nid006606,nid007410,nid007096,nid007566,nid006774,nid007343,nid006867,nid007323,nid007489,nid006676,nid006677,nid007411,nid006848,nid006681,nid007626,nid007612,nid006887,nid006577,nid006729,nid006831,nid007520,nid007589,nid007614,nid006955,nid007592,nid007344,nid007374,nid007134,nid007628,nid007382,nid007141,nid007155,nid007286,nid006589,nid007024,nid007025
 
 set -ex
 
@@ -20,19 +20,19 @@ WORK_DIR="/users/$(id -un)/projects/verl"
 
 # Paths
 SAVE_FOLDER="/iopsstor/scratch/cscs/$(id -un)/apertus-sft-runs"
-DATASET_PATH="/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-5"
+DATASET_PATH="/iopsstor/scratch/cscs/nathanrchn/apertus-full-1"
 
 # Model configuration
-MODEL_PATH="swiss-ai/Apertus-8B-2509"
+MODEL_PATH="/users/nathanrchn/scratch/apertus-sft-runs/Apertus-8B-2509-main-lr5e-6-bs256-test64-warmuplinear-lr_warmup_steps_ratio0.03/2026-01-12_17-41-41/global_step_844/huggingface"
 MODEL_REVISION="main"
-TOKENIZER_PATH="swiss-ai/Apertus-8B-Instruct-2509"
+TOKENIZER_PATH="/users/nathanrchn/scratch/apertus-sft-runs/Apertus-8B-2509-main-lr5e-6-bs256-test64-warmuplinear-lr_warmup_steps_ratio0.03/2026-01-12_17-41-41/global_step_844/huggingface"
 MODEL_DTYPE="bfloat16"
 
 # Data configuration
-MICRO_BATCH_SIZE_PER_GPU=4
+MICRO_BATCH_SIZE_PER_GPU=8
 MAX_LENGTH=8192
-TRAIN_BATCH_SIZE=256
-VAL_BATCH_SIZE=64
+TRAIN_BATCH_SIZE=512
+VAL_BATCH_SIZE=128
 ROLLOUT_BATCH_SIZE=8192
 ROLLOUT_MAX_LENGTH=4096
 TRAIN_FILE="train.parquet"
@@ -46,12 +46,12 @@ LEARNING_RATE="5e-6"
 WARMUP_STYLE="linear"
 LR_WARMUP_STEPS_RATIO=0.03
 TOTAL_EPOCHS=1
-TEST_FREQ=64
+TEST_FREQ=256
 TOTAL_TRAINING_STEPS=null
 WEIGHT_DECAY=0.0
 
 # Experiment configuration
-PROJECT_NAME="apertus-sft-format-following"
+PROJECT_NAME="apertus-sft-full"
 
 # Multi-turn configuration
 ENABLE_MULTITURN=true
@@ -63,7 +63,7 @@ CUSTOM_CLS_NAME="ApertusSFTDataset"
 
 # Rollout
 USE_ROLLOUT=true
-ROLLOUT_MODEL_PATH="swiss-ai/Apertus-8B-Instruct-2509"
+ROLLOUT_MODEL_PATH="/users/nathanrchn/scratch/apertus-sft-runs/Apertus-8B-2509-main-lr5e-6-bs256-test64-warmuplinear-lr_warmup_steps_ratio0.03/2026-01-12_17-41-41/global_step_844/huggingface"
 
 # Logging
 LOGGER='["console","wandb"]'

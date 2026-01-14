@@ -7,8 +7,11 @@ Tasks are registered in TASK_REGISTRY and can be referenced by ID in rollout_par
 from __future__ import annotations
 from typing import Any, Callable, Optional, Union, Dict, List
 import os
+import logging
 from json import loads
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class RolloutParams:
@@ -274,79 +277,162 @@ def mcq_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutParam
 # =============================================================================
 
 if hf_evaluate is not None:
-    HUMANEVAL_CODE_EVAL = hf_evaluate.load("code_eval")
+    CODE_EVAL = hf_evaluate.load("code_eval")
 else:
-    HUMANEVAL_CODE_EVAL = None
+    CODE_EVAL = None
 
 
-def humaneval_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
-    """
-    HumanEval code generation evaluation.
-
-    Requires: HuggingFace evaluate library with code_eval
-
-    Metrics:
-        - humaneval/pass@10: pass@10 metric
-    """
-    if HUMANEVAL_CODE_EVAL is None:
-        return {"humaneval/pass@10": 0.0}
-
-    output_texts = [output["text"] for output in outputs]
-
-    test = params.kwargs.get("test", "")
-    entry_point = params.kwargs.get("entry_point", "")
-    prompt = params.kwargs.get("prompt", "")
-
-    pass_at_k, _ = HUMANEVAL_CODE_EVAL.compute(
-        references=[f"{test}\ncheck({entry_point})"],
-        predictions=[[prompt + ot for ot in output_texts]],
-        k=[10],
-    )
-    return {"humaneval/pass@10": float(pass_at_k["pass@10"])}
+def _extract_code_from_thinking(text: str) -> str:
+    """Extract code from ```python blocks after skipping the thinking section."""
+    if "<|inner_suffix|>" in text:
+        text = text.split("<|inner_suffix|>")[1]  # skip the thinking part
+    if "```python" not in text:
+        return ""
+    return text.split("```python")[1].split("```")[0].strip()
 
 
-def humaneval_thinking_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
-    """
-    HumanEval with extended thinking/reasoning.
-
-    Extracts code from ```python blocks after skipping the thinking section.
-
-    Metrics:
-        - humaneval_thinking/format_ratio: ratio of outputs with proper markdown code blocks
-        - humaneval_thinking/pass@10: pass@10 for extracted code
-    """
-    if HUMANEVAL_CODE_EVAL is None:
-        return {"humaneval_thinking/format_ratio": 0.0, "humaneval_thinking/pass@10": 0.0}
-
-    output_texts = [output["text"] for output in outputs]
-
-    # Calculate format ratio
-    format_count = sum(
+def _compute_valid_ratio(output_texts: list[str]) -> float:
+    """Compute ratio of outputs with proper markdown code blocks (valid format)."""
+    valid_count = sum(
         1 for text in output_texts
         if "```python" in text and "```" in text.split("```python")[1]
     )
-    format_ratio = format_count / len(output_texts)
+    return valid_count / len(output_texts) if output_texts else 0.0
 
-    def extract_code(text: str) -> str:
-        if "<|inner_suffix|>" in text:
-            text = text.split("<|inner_suffix|>")[1]  # skip the thinking part
-        if "```python" not in text:
-            return ""
-        return text.split("```python")[1].split("```")[0].strip()
 
+def _build_test_reference(params: RolloutParams) -> str:
+    """
+    Build test reference string for code evaluation.
+
+    Supports both HumanEval and MBPP formats:
+    - HumanEval: uses 'test' + 'entry_point' with check() call
+    - MBPP: uses 'test_list' (list of assertions) or 'test' directly
+    """
     test = params.kwargs.get("test", "")
     entry_point = params.kwargs.get("entry_point", "")
+    test_list = params.kwargs.get("test_list", [])
 
-    pass_at_k, _ = HUMANEVAL_CODE_EVAL.compute(
-        references=[f"{test}\ncheck({entry_point})"],
-        predictions=[[extract_code(ot) for ot in output_texts]],
-        k=[10],
+    # MBPP format: test_list contains assertion strings
+    if test_list:
+        return "\n".join(test_list)
+
+    # HumanEval format: test contains check function, needs check() call
+    if entry_point and test:
+        return f"{test}\ncheck({entry_point})"
+
+    # Fallback: use test directly
+    return test
+
+
+def code_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
+    """
+    Unified code generation evaluation for HumanEval and MBPP benchmarks.
+
+    Requires: HuggingFace evaluate library with code_eval
+
+    Supports both formats:
+    - HumanEval: prompt + output, test with check(entry_point)
+    - MBPP: output only (no prompt prefix), test_list with assertions
+
+    Metrics:
+        - {task_name}/pass@10: pass@10 metric
+    """
+    task_name = params.task_name
+
+    if CODE_EVAL is None:
+        return {f"{task_name}/pass@10": 0.0}
+
+    output_texts = [output["text"] for output in outputs]
+    prompt = params.kwargs.get("prompt", "")
+
+    # Build predictions: prepend prompt for HumanEval, use raw output for MBPP
+    if prompt:
+        predictions = [[prompt + ot for ot in output_texts]]
+    else:
+        predictions = [output_texts]
+
+    test_reference = _build_test_reference(params)
+
+    n_samples = len(output_texts)
+    ks = [1]
+    if n_samples >= 10:
+        ks.append(10)
+
+    pass_at_k, _ = CODE_EVAL.compute(
+        references=[test_reference],
+        predictions=predictions,
+        k=ks,
     )
 
-    return {
-        "humaneval_thinking/format_ratio": format_ratio,
-        "humaneval_thinking/pass@10": float(pass_at_k["pass@10"]),
-    }
+    metrics = {}
+    if "pass@1" in pass_at_k:
+        metrics[f"{task_name}/accuracy"] = float(pass_at_k["pass@1"])
+    if "pass@10" in pass_at_k:
+        metrics[f"{task_name}/pass@10"] = float(pass_at_k["pass@10"])
+
+    if not metrics:
+        logger.warning(f"No pass@k results found in code evaluation for task {task_name}. Results: {pass_at_k}. Predictions: {predictions} ({n_samples} samples)")
+        metrics[f"{task_name}/accuracy"] = 0.0
+
+    return metrics
+
+
+def code_thinking_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
+    """
+    Unified code evaluation with extended thinking/reasoning.
+
+    Extracts code from ```python blocks after skipping the thinking section.
+    Works for both HumanEval and MBPP benchmarks.
+
+    Metrics:
+        - {task_name}/valid: ratio of outputs with proper markdown code blocks
+        - {task_name}/pass@10: pass@10 for extracted code
+    """
+    task_name = params.task_name
+
+    if CODE_EVAL is None:
+        return {f"{task_name}/valid": 0.0, f"{task_name}/pass@10": 0.0}
+
+    output_texts = [output["text"] for output in outputs]
+
+    valid_ratio = _compute_valid_ratio(output_texts)
+    extracted_code = [_extract_code_from_thinking(ot) for ot in output_texts]
+
+    test_reference = _build_test_reference(params)
+
+    n_samples = len(output_texts)
+    ks = [1]
+    if n_samples >= 10:
+        ks.append(10)
+
+    pass_at_k, _ = CODE_EVAL.compute(
+        references=[test_reference],
+        predictions=[extracted_code],
+        k=ks,
+    )
+
+    metrics = {f"{task_name}/valid": valid_ratio}
+    if "pass@1" in pass_at_k:
+        metrics[f"{task_name}/accuracy"] = float(pass_at_k["pass@1"])
+    if "pass@10" in pass_at_k:
+        metrics[f"{task_name}/pass@10"] = float(pass_at_k["pass@10"])
+
+    if f"{task_name}/accuracy" not in metrics and f"{task_name}/pass@10" not in metrics:
+        logger.warning(f"No pass@k results found in code evaluation for task {task_name}. Results: {pass_at_k}. Predictions: {extracted_code} ({n_samples} samples)")
+        metrics[f"{task_name}/accuracy"] = 0.0
+
+    return metrics
+
+
+# Backward compatibility aliases
+def humaneval_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
+    """HumanEval code generation evaluation. Alias for code_task."""
+    return code_task(outputs, params)
+
+
+def humaneval_thinking_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
+    """HumanEval with thinking. Alias for code_thinking_task."""
+    return code_thinking_task(outputs, params)
 
 
 # =============================================================================
@@ -462,9 +548,13 @@ TASK_REGISTRY: dict[str, Callable[[Union[dict[str, Any], list[dict[str, Any]]], 
     # Multiple choice
     "mcq": mcq_task,
 
-    # Code evaluation
-    "humaneval": humaneval_task,
-    "humaneval_thinking": humaneval_thinking_task,
+    # Code evaluation (unified for HumanEval and MBPP)
+    "code": code_task,
+    "code_thinking": code_thinking_task,
+    "humaneval": code_task,
+    "humaneval_thinking": code_thinking_task,
+    "mbpp": code_task,
+    "mbpp_thinking": code_thinking_task,
 
     # Instruction following
     "ifeval": ifeval_task,

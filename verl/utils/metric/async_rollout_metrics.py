@@ -68,11 +68,12 @@ class AsyncRolloutMetrics:
         self,
         rollout_dataset: MultiTurnSFTDataset,
         rollout_url: str,
-        master_address: str,
-        master_port: int,
-        rollout_batch_size: int,
-        pad_token_id: int,
+        master_address: str = None,
+        master_port: int = None,
+        rollout_batch_size: int = 8192,
+        pad_token_id: int = 3,
         num_workers: int = 128,
+        standalone: bool = False,
     ):
         self.rollout_dataset = rollout_dataset
         self.rollout_url = rollout_url
@@ -81,9 +82,14 @@ class AsyncRolloutMetrics:
         self.rollout_batch_size = rollout_batch_size
         self.pad_token_id = pad_token_id
         self.num_workers = num_workers
+        self.standalone = standalone
 
         self._build_rollout_dataloader()
-        self._init_weight_update_group()
+
+        if standalone:
+            wait_for_server(rollout_url)
+        else:
+            self._init_weight_update_group()
 
         self.compute_metrics_step = 0
         self.compute_metrics_future = None
@@ -319,6 +325,7 @@ class AsyncRolloutMetrics:
 
                     generation_data = {
                         "task_id": params.id,
+                        "task_name": params.task_name,
                         "input": input_text,
                         "output": o["text"],
                         "finish_reason": o["meta_info"]["finish_reason"]["type"],
@@ -327,7 +334,7 @@ class AsyncRolloutMetrics:
                     }
 
                     for key, value in asdict(params).items():
-                        if key not in ["id", "sampling_params"] and isinstance(value, (str, int, float, bool)):
+                        if key not in ["id", "sampling_params", "task_name"] and isinstance(value, (str, int, float, bool)):
                             generation_data[key] = value
 
                     generations_data.append(generation_data)
@@ -348,6 +355,10 @@ class AsyncRolloutMetrics:
         sampled_generations = random.sample(generations_data, min(256, len(generations_data)))
 
         return aggregated_metrics, sampled_generations
+
+    def compute_metrics(self) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        """Compute metrics synchronously (for standalone mode)."""
+        return self._async_compute_metrics()
 
     def shutdown(self):
         """Shutdown the metric computation process pool."""

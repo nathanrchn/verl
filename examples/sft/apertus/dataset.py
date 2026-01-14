@@ -5,6 +5,7 @@ Loads training data and creates rollout evaluation datasets from HuggingFace:
 - GSM8K, MATH-500, Omni-MATH, OlympiadBench (Math reasoning)
 - AVeriTeC (Fact verification)
 - IFEval, IFBench (Instruction following)
+- HumanEval, MBPP (Coding)
 """
 import os
 from json import loads, dumps
@@ -12,11 +13,11 @@ from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset, concatenate_datasets
 
 # Configuration
-INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/format-following-5"
-OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-format-following-5"
+INPUT_DATASET_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/data/sft_1.1/mixtures-linearised/full-1"
+OUTPUT_DATASET_PATH = "/iopsstor/scratch/cscs/nathanrchn/apertus-full-1"
 MODEL_PATH = "swiss-ai/Apertus-8B-Instruct-2509"
 
-VAL_SPLIT_SIZE = 128
+VAL_SPLIT_SIZE = 512
 
 # =============================================================================
 # Load Main Training Dataset
@@ -49,7 +50,8 @@ ANSWERS_TOOL = {
 
 # Grammar to force tool use for display_answers
 ANSWERS_TOOL_GRAMMAR = """%llguidance {}
-start: TEXT? tool_calls <|assistant_end|>
+start: (text_or_thinking)? tool_calls
+text_or_thinking: TEXT | (<|inner_prefix|> TEXT <|inner_suffix|>)
 
 tool_calls: <|tools_prefix|> %json {
     "type": "array",
@@ -164,6 +166,7 @@ def make_rollout_sample(
     with_tools: bool = True,
     grammar: str = None,
     extra_sampling_params: dict = None,
+    enable_thinking: bool = False,
     kwargs: dict = None,
 ) -> dict:
     """Create a standard rollout sample."""
@@ -195,7 +198,7 @@ def make_rollout_sample(
         ]),
         "tools": dumps([ANSWERS_TOOL]) if with_tools else "",
         "rollout_params": dumps(rollout_params),
-        "enable_thinking": False,
+        "enable_thinking": enable_thinking,
     }
 
 
@@ -211,11 +214,31 @@ def gsm8k_to_standard_format(x):
         answer=answer,
         task_id="gsm8k",
         task_name="gsm8k",
+        extra_sampling_params={"temperature": 0.8},
     )
 
 
 gsm8k_dataset = load_dataset("openai/gsm8k", name="main", split="test").map(
     gsm8k_to_standard_format,
+    num_proc=64,
+    remove_columns=["question", "answer"]
+)
+
+# GSM8K (Thinking)
+def gsm8k_thinking_to_standard_format(x):
+    answer = x["answer"].split("#### ")[-1].replace(",", "").strip()
+    return make_rollout_sample(
+        question=x["question"],
+        answer=answer,
+        task_id="gsm8k",
+        task_name="gsm8k_thinking",
+        enable_thinking=True,
+        max_new_tokens=4096,
+        extra_sampling_params={"temperature": 0.8},
+    )
+
+gsm8k_thinking_dataset = load_dataset("openai/gsm8k", name="main", split="test").map(
+    gsm8k_thinking_to_standard_format,
     num_proc=64,
     remove_columns=["question", "answer"]
 )
@@ -227,6 +250,7 @@ def math_500_to_standard_format(x):
         answer=x["answer"],
         task_id="math_500",
         task_name="math_500",
+        extra_sampling_params={"temperature": 0.8},
     )
 
 
@@ -305,6 +329,7 @@ def averitec_to_standard_format(x):
         task_name="averitec",
         system_prompt=AVERITEC_GUIDE,
         max_new_tokens=512,
+        extra_sampling_params={"temperature": 0.8},
     )
 
 
@@ -329,7 +354,7 @@ def ifeval_to_standard_format(x):
         task_id="ifeval",
         task_name="ifeval",
         with_tools=False,
-        extra_sampling_params={"temperature": 0},
+        extra_sampling_params={"temperature": 0.8},
         kwargs={
             "instruction_id_list": x["instruction_id_list"],
             "instruction_kwargs": x["kwargs"],
@@ -350,7 +375,7 @@ def ifbench_to_standard_format(x):
         task_id="ifbench",
         task_name="ifbench",
         with_tools=False,
-        extra_sampling_params={"temperature": 0},
+        extra_sampling_params={"temperature": 0.8},
         kwargs={
             "instruction_id_list": x["instruction_id_list"],
             "instruction_kwargs": x["kwargs"],
@@ -365,12 +390,167 @@ ifbench_dataset = load_dataset("allenai/IFBench_test", split="train").map(
 )
 
 # =============================================================================
+# Coding Datasets
+# =============================================================================
+
+def humaneval_to_standard_format(x):
+    o = {}
+    o["messages"] = dumps(
+        [
+            {"role": "system", "content": {"text": ""}},
+            {
+                "role": "user",
+                "content": {
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": f"Write a solution to the following problem and make sure that it passes the tests:\n```python\n{x['prompt']}\n```\n",
+                        }
+                    ]
+                },
+            },
+            {
+                "role": "assistant",
+                "content": {
+                    "blocks": [
+                        {"type": "response", "text": f"Here is the completed function:\n```python\n{x['prompt']}\n"}
+                    ]
+                },
+            },
+        ]
+    )
+    o["tools"] = dumps([])
+    o["rollout_params"] = dumps(
+        {
+            "id": "humaneval",
+            "task_id": x["task_id"],
+            "task_name": "humaneval",
+            "test": x["test"],
+            "prompt": x["prompt"],
+            "entry_point": x["entry_point"],
+            "sampling_params": {
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "max_new_tokens": 2048,
+                "n": 10,
+                "stop": ["```"]
+            },
+            "apply_chat_template_kwargs": {"continue_assistant_message": True},
+        }
+    )
+    o["enable_thinking"] = False
+    return o
+
+
+humaneval_dataset = load_dataset("openai/openai_humaneval", split="test").map(
+    humaneval_to_standard_format,
+    num_proc=64,
+    remove_columns=["task_id", "prompt", "canonical_solution", "test", "entry_point"],
+)
+
+
+def humaneval_thinking_to_standard_format(x):
+    o = {}
+    o["messages"] = dumps(
+        [
+            {"role": "system", "content": {"text": ""}},
+            {
+                "role": "user",
+                "content": {
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": f"Write a solution to the following problem and make sure that it passes the tests:\n```python\n{x['prompt']}\n```\n",
+                        }
+                    ]
+                },
+            },
+        ]
+    )
+    o["tools"] = dumps([])
+    o["rollout_params"] = dumps(
+        {
+            "id": "humaneval_thinking",
+            "task_id": x["task_id"],
+            "task_name": "humaneval_thinking",
+            "test": x["test"],
+            "prompt": x["prompt"],
+            "entry_point": x["entry_point"],
+            "sampling_params": {
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "max_new_tokens": 16384,
+                "n": 10,
+                "skip_special_tokens": False,
+            },
+            "apply_chat_template_kwargs": {},
+        }
+    )
+    o["enable_thinking"] = True
+    return o
+
+
+humaneval_thinking_dataset = load_dataset("openai/openai_humaneval", split="test").map(
+    humaneval_thinking_to_standard_format,
+    num_proc=64,
+    remove_columns=["task_id", "prompt", "canonical_solution", "test", "entry_point"],
+)
+
+
+def mbpp_thinking_to_standard_format(x):
+    o = {}
+    o["messages"] = dumps(
+        [
+            {"role": "system", "content": {"text": ""}},
+            {
+                "role": "user",
+                "content": {
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": f"You are an expert Python programmer, and here is your task:\n{x['prompt']}\nYour code should pass these tests:\n{'\n'.join(x['test_list'])}",
+                        }
+                    ]
+                },
+            },
+        ]
+    )
+    o["tools"] = dumps([])
+    o["rollout_params"] = dumps(
+        {
+            "id": "mbpp_thinking",
+            "task_id": x["task_id"],
+            "task_name": "mbpp_thinking",
+            "prompt": x["prompt"],
+            "test_imports": x["test_imports"],
+            "test_list": x["test_list"],
+            "sampling_params": {
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "max_new_tokens": 16384,
+                "skip_special_tokens": False,
+            },
+            "apply_chat_template_kwargs": {},
+        }
+    )
+    o["enable_thinking"] = True
+    return o
+
+
+mbpp_thinking_dataset = load_dataset("google-research-datasets/mbpp", name="sanitized", split="test").map(
+    mbpp_thinking_to_standard_format,
+    num_proc=64,
+    remove_columns=["source_file", "task_id", "prompt", "code", "test_imports", "test_list"],
+)
+
+# =============================================================================
 # Combine All Rollout Datasets
 # =============================================================================
 
 rollout_dataset = concatenate_datasets([
     # Math reasoning
     gsm8k_dataset,
+    gsm8k_thinking_dataset,
     math_500_dataset,
     # omni_math_dataset,
     # olympiad_bench_dataset,
@@ -379,6 +559,10 @@ rollout_dataset = concatenate_datasets([
     # Instruction following
     ifeval_dataset,
     ifbench_dataset,
+    # Coding
+    humaneval_dataset,
+    humaneval_thinking_dataset,
+    # mbpp_thinking_dataset,
 ])
 
 # =============================================================================
@@ -393,12 +577,16 @@ print(f"Validation dataset: {len(val_dataset)} samples")
 print(f"Rollout dataset: {len(rollout_dataset)} samples")
 print("\nRollout dataset breakdown:")
 print(f"  - GSM8K: {len(gsm8k_dataset)}")
+print(f"  - GSM8K (Thinking): {len(gsm8k_thinking_dataset)}")
 print(f"  - MATH-500: {len(math_500_dataset)}")
 # print(f"  - Omni-MATH: {len(omni_math_dataset)}")
 # print(f"  - OlympiadBench: {len(olympiad_bench_dataset)}")
 print(f"  - AVeriTeC: {len(averitec_dataset)}")
 print(f"  - IFEval: {len(ifeval_dataset)}")
 print(f"  - IFBench: {len(ifbench_dataset)}")
+print(f"  - HumanEval: {len(humaneval_dataset)}")
+print(f"  - HumanEval (Thinking): {len(humaneval_thinking_dataset)}")
+# print(f"  - MBPP (Thinking): {len(mbpp_thinking_dataset)}")
 
 # Save datasets
 train_dataset.to_parquet(os.path.join(OUTPUT_DATASET_PATH, "train.parquet"))
