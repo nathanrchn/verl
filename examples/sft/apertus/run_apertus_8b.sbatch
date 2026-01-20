@@ -20,12 +20,12 @@ WORK_DIR="/users/$(id -un)/projects/verl"
 
 # Paths
 SAVE_FOLDER="/iopsstor/scratch/cscs/$(id -un)/apertus-sft-runs"
-DATASET_PATH="/iopsstor/scratch/cscs/nathanrchn/apertus-full-1"
+DATASET_PATH="/capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/data/apertus-format-following-5"
 
 # Model configuration
-MODEL_PATH="/users/nathanrchn/scratch/apertus-sft-runs/Apertus-8B-2509-main-lr5e-6-bs256-test64-warmuplinear-lr_warmup_steps_ratio0.03/2026-01-12_17-41-41/global_step_844/huggingface"
+MODEL_PATH="swiss-ai/Apertus-8B-2509"
 MODEL_REVISION="main"
-TOKENIZER_PATH="/users/nathanrchn/scratch/apertus-sft-runs/Apertus-8B-2509-main-lr5e-6-bs256-test64-warmuplinear-lr_warmup_steps_ratio0.03/2026-01-12_17-41-41/global_step_844/huggingface"
+TOKENIZER_PATH="swiss-ai/Apertus-8B-Instruct-2509"
 MODEL_DTYPE="bfloat16"
 
 # Data configuration
@@ -51,7 +51,7 @@ TOTAL_TRAINING_STEPS=null
 WEIGHT_DECAY=0.0
 
 # Experiment configuration
-PROJECT_NAME="apertus-sft-full"
+PROJECT_NAME="apertus-sft-format-following"
 
 # Multi-turn configuration
 ENABLE_MULTITURN=true
@@ -63,7 +63,7 @@ CUSTOM_CLS_NAME="ApertusSFTDataset"
 
 # Rollout
 USE_ROLLOUT=true
-ROLLOUT_MODEL_PATH="/users/nathanrchn/scratch/apertus-sft-runs/Apertus-8B-2509-main-lr5e-6-bs256-test64-warmuplinear-lr_warmup_steps_ratio0.03/2026-01-12_17-41-41/global_step_844/huggingface"
+ROLLOUT_MODEL_PATH="swiss-ai/Apertus-8B-Instruct-2509"
 
 # Logging
 LOGGER='["console","wandb"]'
@@ -71,6 +71,10 @@ LOGGER='["console","wandb"]'
 # Generate run name and experiment name from key parameters
 MODEL_NAME=$(basename "$MODEL_PATH")
 RUN_NAME="${MODEL_NAME}-${MODEL_REVISION}-lr${LEARNING_RATE}-bs${TRAIN_BATCH_SIZE}-test${TEST_FREQ}-warmup${WARMUP_STYLE}-lr_warmup_steps_ratio${LR_WARMUP_STEPS_RATIO}"
+
+# Environment
+VERL_ENVIRONMENT="/capstor/store/cscs/swissai/infra01/reasoning/imgs/projects/verl_swiss:1/env.toml"
+SGLANG_ROUTER_ENVIRONMENT="/capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/images/sglang_router/env.toml"
 
 nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 head_node=${nodes[0]}
@@ -86,7 +90,7 @@ cp "$0" "$save_path/run_apertus_8b.sbatch"
 # Build project wheel once on the head node and store it in a shared location
 WHEEL_DIR="$save_path/wheels"
 mkdir -p "$WHEEL_DIR"
-srun --nodes=1 --ntasks=1 --nodelist=$head_node --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 --output=$save_path/wheel_build.log --error=$save_path/wheel_build.err \
+srun --nodes=1 --ntasks=1 --nodelist=$head_node --container-writable --environment=$VERL_ENVIRONMENT --kill-on-bad-exit=1 --output=$save_path/wheel_build.log --error=$save_path/wheel_build.err \
     bash --norc --noprofile -c "\
 set -ex
 cd $WORK_DIR
@@ -110,12 +114,12 @@ for local_rank in $(seq 0 $((TRAINING_NODES - 1))); do
     node=${nodes[$local_rank]}
 
     if [ "$local_rank" -eq 0 ]; then
-        install_command="pip install /iopsstor/scratch/cscs/nathanrchn/evaluate-0.4.6-py3-none-any.whl"
+        install_command="pip install /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/evaluate-0.4.6-py3-none-any.whl"
     else
         install_command=""
     fi
 
-    srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 --output=$save_path/node_${local_rank}.log --error=$save_path/node_${local_rank}.err \
+    srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=$VERL_ENVIRONMENT --kill-on-bad-exit=1 --output=$save_path/node_${local_rank}.log --error=$save_path/node_${local_rank}.err \
         bash --norc --noprofile -c "\
 set -ex
 
@@ -131,11 +135,11 @@ cd $WORK_DIR
 
 $install_command
 
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/nltk-3.9.2-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/emoji-2.15.0-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/syllapy-0.7.2-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/langdetect-1.0.9-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/immutabledict-4.2.2-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/nltk-3.9.2-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/emoji-2.15.0-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/syllapy-0.7.2-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/langdetect-1.0.9-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/immutabledict-4.2.2-py3-none-any.whl
 
 pip install $PACKAGE_WHEEL --no-cache-dir --no-deps --force-reinstall
 
@@ -194,7 +198,7 @@ if [ "$USE_ROLLOUT" = true ]; then
         for i in $(seq 0 3); do
             port=$((50000 + i))
             WORKER_URLS="${WORKER_URLS} http://${node_ip}:${port}"
-            srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 --gpus-per-task=1 --cpus-per-task=50 --gpu-bind=map_gpu:${i} --overlap --output=$save_path/node_rollout_${node_idx}_$i.log --error=$save_path/node_rollout_${node_idx}_$i.err \
+            srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=$VERL_ENVIRONMENT --kill-on-bad-exit=1 --gpus-per-task=1 --cpus-per-task=50 --gpu-bind=map_gpu:${i} --overlap --output=$save_path/node_rollout_${node_idx}_$i.log --error=$save_path/node_rollout_${node_idx}_$i.err \
                 bash --norc --noprofile -c "\
 set -ex
 
@@ -211,7 +215,7 @@ python -m sglang.launch_server --model-path=$ROLLOUT_MODEL_PATH --dtype=bfloat16
         done
     done
 
-    srun --nodes=1 --ntasks=1 --nodelist=$rollout_node1 --container-writable --environment=sglang_router --kill-on-bad-exit=1 --cpus-per-task=50 --overlap --output=$save_path/node_rollout_router.log --error=$save_path/node_rollout_router.err \
+    srun --nodes=1 --ntasks=1 --nodelist=$rollout_node1 --container-writable --environment=$SGLANG_ROUTER_ENVIRONMENT --kill-on-bad-exit=1 --cpus-per-task=50 --overlap --output=$save_path/node_rollout_router.log --error=$save_path/node_rollout_router.err \
         bash --norc --noprofile -c "\
 set -ex
 
