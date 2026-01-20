@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""
-Launch standalone evaluation job.
-
-Usage:
-    python -m verl.utils.metric.launch_eval \
-        --model-path /path/to/model \
-        --dataset-path /path/to/rollout.parquet \
-        --wandb-project my-project
-"""
-import os
 import argparse
 import subprocess
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 
 SBATCH_TEMPLATE = '''#!/bin/bash
 #SBATCH --job-name=eval-{run_name}
@@ -45,21 +35,32 @@ mkdir -p "$save_path"
 # Build wheel
 WHEEL_DIR="$save_path/wheels"
 mkdir -p "$WHEEL_DIR"
-srun --nodes=1 --ntasks=1 --nodelist=$node1 --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 --output=$save_path/wheel.log --error=$save_path/wheel.err \
+srun --nodes=1 --ntasks=1 --nodelist=$node1 --container-writable --environment=/capstor/store/cscs/swissai/infra01/reasoning/imgs/projects/verl_swiss:1/env.toml --kill-on-bad-exit=1 --output=$save_path/wheel.log --error=$save_path/wheel.err \
     bash --norc --noprofile -c "cd $WORK_DIR && pip wheel . --no-cache-dir --no-deps -w $WHEEL_DIR"
 WHEEL=$(ls -t "$WHEEL_DIR"/*.whl | head -n1)
 
 # Start 8 sglang workers (4 per node)
 WORKER_URLS=""
 for node_idx in 1 2; do
-    [ "$node_idx" -eq 1 ] && node=$node1 && node_ip=$node1_ip || node=$node2 && node_ip=$node2_ip
+    if [ "$node_idx" -eq 1 ]; then
+        node=$node1
+        node_ip=$node1_ip
+    else
+        node=$node2
+        node_ip=$node2_ip
+    fi
     for gpu in 0 1 2 3; do
         port=$((50000 + gpu))
         WORKER_URLS="${{WORKER_URLS}} http://${{node_ip}}:${{port}}"
-        srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 \
+        srun --nodes=1 --ntasks=1 --nodelist=$node --container-writable --environment=/capstor/store/cscs/swissai/infra01/reasoning/imgs/projects/verl_swiss:1/env.toml --kill-on-bad-exit=1 \
             --gpus-per-task=1 --cpus-per-task=50 --gpu-bind=map_gpu:${{gpu}} --overlap \
             --output=$save_path/worker_${{node_idx}}_${{gpu}}.log --error=$save_path/worker_${{node_idx}}_${{gpu}}.err \
             bash --norc --noprofile -c "
+set -ex
+
+export no_proxy="0.0.0.0,$no_proxy"
+export NO_PROXY="0.0.0.0,$NO_PROXY"
+
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=$gpu
 python -m sglang.launch_server --model-path=$MODEL_PATH --dtype=bfloat16 --host=0.0.0.0 --port=$port \
@@ -68,23 +69,29 @@ python -m sglang.launch_server --model-path=$MODEL_PATH --dtype=bfloat16 --host=
 done
 
 # Start router
-srun --nodes=1 --ntasks=1 --nodelist=$node1 --container-writable --environment=sglang_router --kill-on-bad-exit=1 \
+srun --nodes=1 --ntasks=1 --nodelist=$node1 --container-writable --environment=/capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/images/sglang_router/env.toml --kill-on-bad-exit=1 \
     --cpus-per-task=50 --overlap --output=$save_path/router.log --error=$save_path/router.err \
-    bash --norc --noprofile -c "python -m sglang_router.launch_router --host 0.0.0.0 --port 30000 --worker-urls $WORKER_URLS --model-path $MODEL_PATH --policy round_robin" &
+    bash --norc --noprofile -c "
+set -ex
 
-sleep 30
+export no_proxy="0.0.0.0,$no_proxy"
+export NO_PROXY="0.0.0.0,$NO_PROXY"
+
+python -m sglang_router.launch_router --host 0.0.0.0 --port 30000 --worker-urls $WORKER_URLS --model-path $MODEL_PATH --policy round_robin" &
+
+sleep 120
 
 # Run evaluation
-srun --nodes=1 --ntasks=1 --nodelist=$node1 --container-writable --environment=verl_swiss_old --kill-on-bad-exit=1 \
+srun --nodes=1 --ntasks=1 --nodelist=$node1 --container-writable --environment=/capstor/store/cscs/swissai/infra01/reasoning/imgs/projects/verl_swiss:1/env.toml --kill-on-bad-exit=1 \
     --cpus-per-task=50 --overlap --output=$save_path/eval.log --error=$save_path/eval.err \
     bash --norc --noprofile -c "
 cd $WORK_DIR
-pip install /iopsstor/scratch/cscs/nathanrchn/evaluate-0.4.6-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/nltk-3.9.2-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/emoji-2.15.0-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/syllapy-0.7.2-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/langdetect-1.0.9-py3-none-any.whl
-pip install --no-deps /iopsstor/scratch/cscs/nathanrchn/immutabledict-4.2.2-py3-none-any.whl
+pip install /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/evaluate-0.4.6-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/nltk-3.9.2-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/emoji-2.15.0-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/syllapy-0.7.2-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/langdetect-1.0.9-py3-none-any.whl
+pip install --no-deps /capstor/store/cscs/swissai/infra01/reasoning/users/nathanrchn/wheels/immutabledict-4.2.2-py3-none-any.whl
 pip install $WHEEL --no-cache-dir --no-deps --force-reinstall
 
 python -m verl.utils.metric.main \
