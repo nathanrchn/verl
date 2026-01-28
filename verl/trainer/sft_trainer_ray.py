@@ -26,7 +26,6 @@ import logging
 import hydra
 import ray
 import torch
-import torch.distributed
 from omegaconf import OmegaConf
 from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -39,7 +38,7 @@ from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.logger import log_with_rank
 from verl.utils.tracking import Tracking
-from verl.workers.engine_workers import TrainingWorker
+from verl.experimental.fully_async_policy.engine_workers import DetachActorWorker
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -63,6 +62,12 @@ class SFTTrainer:
         self.resume_global_step = self.ckpt_handler.load_checkpoint()
 
         self.device_name = self.config.trainer.device
+
+        # Initialize eval manager if evaluation is enabled
+        if hasattr(config, 'eval') and config.eval.get('enable', False):
+            self._build_eval_manager()
+        else:
+            self.eval_manager = None
 
         print(self.config)
 
@@ -105,19 +110,30 @@ class SFTTrainer:
             assert self.end_profile_step < 0
 
     def _build_engine(self):
-        from verl.workers.engine_workers import TrainingWorkerConfig
+        """
+        Build training engine using DetachActorWorker for NCCL sync support.
+        DetachActorWorker extends TrainingWorker with weight synchronization capability.
+        """
         from verl.workers.utils.losses import sft_loss
 
         self.loss_fn = partial(sft_loss, config=None)
 
-        config = TrainingWorkerConfig(
-            model_type="language_model",
-            model_config=self.model_config,
-            engine_config=self.engine_config,
-            optimizer_config=self.optimizer_config,
-            checkpoint_config=self.checkpoint_config,
-            profiler_config=self.profiler_config,
-        )
+        # Build config compatible with DetachActorWorker
+        # DetachActorWorker expects a DictConfig with actor and rollout settings
+        from omegaconf import OmegaConf
+
+        actor_rollout_ref_config = OmegaConf.create({
+            "model": self.config.model,
+            "actor": {
+                "model_type": "language_model",
+                "model_config": self.model_config,
+                "engine_config": self.engine_config,
+                "optimizer_config": self.optimizer_config,
+                "checkpoint_config": self.checkpoint_config,
+                "profiler_config": self.profiler_config,
+            },
+            "hybrid_engine": False,
+        })
 
         # create resource pool and worker group
         from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -125,14 +141,28 @@ class SFTTrainer:
         n_gpus_per_node = self.config.trainer.n_gpus_per_node
         nnodes = self.config.trainer.nnodes
         self.resource_pool = RayResourcePool(process_on_nodes=[n_gpus_per_node] * nnodes)
-        ray_cls_with_init = RayClassWithInitArgs(ray.remote(TrainingWorker), config=config)
+        ray_cls_with_init = RayClassWithInitArgs(
+            ray.remote(DetachActorWorker),
+            config=actor_rollout_ref_config,
+            role="actor",
+        )
         self.training_client = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=ray_cls_with_init,
             device_name=self.config.trainer.device,
         )
+        self.training_client.init_model()
         self.training_client.set_loss_fn(loss_fn=self.loss_fn)
-        self.training_client.reset()
+
+    def _build_eval_manager(self):
+        """Build eval manager with Ray-managed rollout workers."""
+        from verl.utils.eval import EvalManager, EvalConfig
+
+        self.eval_manager = EvalManager(
+            config=EvalConfig.from_omega(self.config.eval),
+            tokenizer=self.model_config.tokenizer,
+            actor_worker_group=self.training_client,  # For NCCL sync
+        )
 
     def _build_dataset(self):
         config = self.config
@@ -339,6 +369,30 @@ class SFTTrainer:
                     metric = {"val/loss": val_loss.detach().item()}
                     tracking.log(data=metric, step=global_step)
                     last_valid_metric = metric
+
+                    # Run evaluation if eval manager is enabled
+                    if self.eval_manager is not None:
+                        try:
+                            import asyncio
+                            eval_metrics, generations = asyncio.run(
+                                self.eval_manager.evaluate(step=global_step)
+                            )
+                            # Log metrics
+                            tracking.log(data=eval_metrics, step=global_step)
+
+                            # Log sampled generations
+                            self.eval_manager.generation_logger.log(
+                                loggers=tracking.logger,
+                                generations=generations,
+                                step=global_step,
+                            )
+                        except Exception as e:
+                            log_with_rank(
+                                f"Warning: Evaluation failed: {e}",
+                                logger=logger,
+                                rank=0,
+                                log_only_rank_0=True,
+                            )
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     self.ckpt_handler.save_checkpoint(step=global_step)

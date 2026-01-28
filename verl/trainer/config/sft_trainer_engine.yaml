@@ -81,3 +81,29 @@ trainer:
   n_gpus_per_node: 1
 
   profile_interval: [-1, -1]
+
+eval:
+  enable: true
+  num_workers: 128
+  log_generations: 256
+  degeneration_threshold: 0.9
+  device: cuda
+
+  rollout:
+    name: sglang
+    nnodes: 4
+    n_gpus_per_node: 4
+    tensor_model_parallel_size: 1
+
+  rollout_config: null
+
+  benchmarks:
+    - gsm8k
+    - gsm8k_thinking
+    - math_500
+    - averitec
+    - ifeval
+    - ifbench
+    - humaneval
+    - humaneval_thinking
+    - mbpp_thinking
